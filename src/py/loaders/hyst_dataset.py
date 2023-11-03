@@ -49,7 +49,7 @@ class HystDataset(Dataset):
             vid = self.read_mp4(vid_path)
         except:
             print("Error reading: " + vid_path)
-            vid = torch.zeros(3, 50, 256, 256, dtype=torch.float32)
+            vid = torch.zeros(10, 256, 256, 3, dtype=torch.float32)
 
         if(self.transform):
             vid = self.transform(vid)            
@@ -57,7 +57,7 @@ class HystDataset(Dataset):
         if self.class_column:            
             return vid, torch.tensor(self.df.iloc[idx][self.class_column]).to(torch.long)
         
-        return img
+        return vid
 
     def read_mp4(self, fname):
         cap = cv2.VideoCapture(fname)
@@ -165,7 +165,8 @@ class RandomChoice:
         self.num_frames = num_frames
     def __call__(self, x):
         if self.num_frames > 0:
-            idx = torch.randint(0, high=x.shape[0], size=(min(self.num_frames, len(x)),))
+            # idx = torch.randint(0, high=x.shape[0], size=(min(self.num_frames, len(x)),))
+            idx = torch.randint(0, high=x.shape[0], size=(self.num_frames,))
             if self.num_frames == 1:
                 x = x[idx[0]]
             else:

@@ -27,12 +27,18 @@ def main(args):
     unique_class_weights = np.array(class_weight.compute_class_weight(class_weight='balanced', classes=unique_classes, y=df_train[args.class_column]))
     
     
-    hystdata = HystDataModule(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, img_column=args.img_column, class_column=args.class_column, mount_point=args.mount_point, train_transform=TrainTransforms(), valid_transform=EvalTransforms())
+    hystdata = HystDataModule(df_train, df_train, df_test, batch_size=args.batch_size, num_workers=args.num_workers, img_column=args.img_column, class_column=args.class_column, mount_point=args.mount_point, train_transform=TrainTransforms(), valid_transform=EvalTransforms())
 
     hystdata.setup()
 
+    vid_shape = []
     for idx, batch in enumerate(hystdata.val_dataloader()):
         x, y = batch
+        vid_shape.append(x.shape)
+    
+    df_train['shape'] = vid_shape
+
+    df_train.to_csv(args.csv_train.replace('.csv', '_wshape.csv'), index=False)
 
 
 if __name__ == '__main__':

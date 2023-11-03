@@ -36,7 +36,7 @@ def main(args):
     df_test = pd.read_csv(test_fn)
 
     
-    ttdata = HystDataModule(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, img_column=args.img_column, class_column=args.class_column, mount_point=args.mount_point, train_transform=TrainTransforms(), valid_transform=EvalTransforms())
+    ttdata = HystDataModule(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, img_column=args.img_column, class_column=args.class_column, mount_point=args.mount_point, train_transform=TrainTransforms(num_frames=args.num_frames), valid_transform=EvalTransforms(num_frames=args.num_frames))
 
     model = HystNet(args, out_features=unique_classes.shape[0], class_weights=unique_class_weights)
 
@@ -83,6 +83,7 @@ if __name__ == '__main__':
     parser.add_argument('--mount_point', help='Dataset mount directory', type=str, default="./")
     parser.add_argument('--num_workers', help='Number of workers for loading', type=int, default=4)
     parser.add_argument('--batch_size', help='Batch size', type=int, default=128)
+    parser.add_argument('--num_frames', help='Number of frames', type=int, default=100)
     # parser.add_argument('--nn', help='Type of neural network', type=str, default="efficientnet_v2s")    
     parser.add_argument('--tb_dir', help='Tensorboard output dir', type=str, default=None)
     parser.add_argument('--tb_name', help='Tensorboard experiment name', type=str, default="hyst_classification")
