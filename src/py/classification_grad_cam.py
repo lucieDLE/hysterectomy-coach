@@ -4,12 +4,12 @@ import math
 import os
 import pandas as pd
 import numpy as np 
-
+import pdb
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from nets.classification import HystNet
+from nets.classification import HystNet, ResNetLSTM, ResNetLSTM_p2
 from loaders.hyst_dataset import HystDataset, TestTransforms
 from callbacks.logger import ImageLogger
 
@@ -23,6 +23,7 @@ from sklearn.utils import class_weight
 from sklearn.metrics import classification_report
 
 from tqdm import tqdm
+from torchvision.models import resnet50, ResNet50_Weights
 
 import pickle
 
@@ -55,32 +56,32 @@ def main(args):
     
     df_test = pd.read_csv(test_fn)
 
-    
-    # ttdata = HystDataModule(df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, img_column=args.img_column, class_column=args.class_column, mount_point=args.mount_point, train_transform=TrainTransforms(), valid_transform=EvalTransforms())
-
     use_class_column = False
     if args.class_column is not None and args.class_column in df_test.columns:
         use_class_column = True
 
-    model = HystNet(args).load_from_checkpoint(args.model)
+    model = ResNetLSTM.load_from_checkpoint(args.model, strict=True)
     model.eval()
     model.cuda()
+    # print(model)
+    target_layers = model.model[-2]
 
-    # target_layers = [model.model[0].module.layer4[-1]]
+    # pdb.set_trace()
 
-    model = nn.Sequential(
-        model.model[0], 
-        model.model[1],
-        AvgPool1D()
-        )
-    model.eval()
-    model.cuda()
-
-    target_layers = [model[0].module.layer4[-1]]
+    # model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+    # target_layers = [model.layer4[-1]]
+    # model = nn.Sequential(
+    #     model.model[0], 
+    #     model.model[1],
+    #     AvgPool1D()
+    #     )
+    # model.eval()
+    # model.cuda()
+    # target_layers = [model[0].module.layer4[-1]]
 
     # Construct the CAM object once, and then re-use it on many images:
     cam = GradCAM(model=model, target_layers=target_layers, use_cuda=True)
-
+    torch.backends.cudnn.enabled=False
     # You can also use it within a with statement, to make sure it is freed,
     # In case you need to re-create it inside an outer loop:
     # with GradCAM(model=model, target_layers=target_layers, use_cuda=args.use_cuda) as cam:
@@ -103,10 +104,13 @@ def main(args):
     probs = []
     features = []
     pbar = tqdm(enumerate(test_loader), total=len(test_loader))
+    # pdb.set_trace()
     for idx, X in pbar: 
         if use_class_column:
             X, Y = X
-        X = X.cuda().contiguous()   
+        # X = X.cuda().contiguous()
+        # x = X.view(X.shape[0] * X.shape[1],X.shape[2], X.shape[3], X.shape[4])
+
         
         targets = [ClassifierOutputTarget(args.target_class)]
 
@@ -117,7 +121,7 @@ def main(args):
 
         vid_path = df_test.loc[idx][args.img_column]
 
-        out_vid_path = vid_path.replace(os.path.splitext(vid_path)[1], '.avi')
+        out_vid_path = vid_path.replace(os.path.splitext(vid_path)[1], '.mp4')
 
         out_vid_path = os.path.join(args.out, out_vid_path)
 
@@ -129,7 +133,7 @@ def main(args):
         vid_np = scale_intensity(X).permute(0,1,3,4,2).squeeze().cpu().numpy().squeeze().astype(np.uint8)
         gcam_np = scale_intensity(gcam_np).squeeze().numpy().astype(np.uint8)
 
-        fourcc = cv2.VideoWriter_fourcc(*'DIVX')
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(out_vid_path, fourcc, args.fps, (256, 256))
 
         for v, g in zip(vid_np, gcam_np):

@@ -13,7 +13,8 @@ class ImageLogger(Callback):
             x, _ = batch            
             
             x = x.reshape(-1, 3, 256, 256)
-
             max_num_image = min(x.shape[0], self.num_images)
             grid_x = torchvision.utils.make_grid(x)
-            trainer.logger.experiment.add_image('img', grid_x[0:max_num_image], 0)
+            grid_x = grid_x.permute(1, 2, 0)
+            # print(grid_x.shape)
+            # trainer.logger.experiment.log_image(grid_x[0:max_num_image],'img', 0)
