@@ -14,7 +14,8 @@ import torch.optim as optim
 
 import pytorch_lightning as pl
 import torch.nn.init as init
-from torchsummary import summary
+
+from sklearn.metrics import classification_report
 
 
 class NLBlock(nn.Module):
@@ -63,27 +64,27 @@ class TimeConv(nn.Module):
         
         x1 = self.timeconv1(x)
         y1 = x1.transpose(1, 2)
-        y1 = y1.view(-1,30,512,1)
+        y1 = y1.view(-1,x.shape[2],512,1)
 
         x2 = self.timeconv2(x)
         y2 = x2.transpose(1, 2)
-        y2 = y2.view(-1,30,512,1)
+        y2 = y2.view(-1,x.shape[2],512,1)
 
         x3 = self.timeconv3(x)
         y3 = x3.transpose(1, 2)
-        y3 = y3.view(-1,30,512,1)
+        y3 = y3.view(-1,x.shape[2],512,1)
 
         x4 = F.pad(x, (1,0), mode='constant', value=0)
         x4 = self.maxpool_m(x4)
         y4 = x4.transpose(1, 2)
-        y4 = y4.view(-1,30,512,1)
+        y4 = y4.view(-1,x.shape[2],512,1)
 
         y0 = x.transpose(1, 2)
-        y0 = y0.view(-1,30,512,1)
+        y0 = y0.view(-1,x.shape[2],512,1)
 
         y = torch.cat((y0,y1,y2,y3,y4), dim=3)
         y = self.maxpool(y)
-        y = y.view(-1,30,512)
+        y = y.view(-1,x.shape[2],512)
         
         return y
 
@@ -128,7 +129,7 @@ class RecurrentLayer(nn.Module):
 
 class HystNet(pl.LightningModule):
     def __init__(self, args = None, out_features=4, class_weights=None, features=False):
-        super(HystNet, self).__init__()        
+        super(HystNet, self).__init__()
         
         self.save_hyperparameters()        
         self.args = args
@@ -139,7 +140,7 @@ class HystNet(pl.LightningModule):
         if(class_weights is not None):
             class_weights = torch.tensor(class_weights).to(torch.float32)
             
-        self.loss = nn.CrossEntropyLoss(weight=class_weights)
+        self.loss = nn.CrossEntropyLoss(reduction='sum', weight=class_weights)
         self.accuracy = torchmetrics.Accuracy(task='multiclass', num_classes=out_features)
 
         
@@ -204,15 +205,230 @@ class HystNet(pl.LightningModule):
         self.accuracy(x, y)
         self.log("val_acc", self.accuracy)
 
+
 class ResNetLSTM(pl.LightningModule):
     def __init__(self, args=None, out_features=4, class_weights=None, features=False):
         super(ResNetLSTM, self).__init__()
+        self.save_hyperparameters()
+        self.args = args
+
+        self.class_weights = class_weights
+        self.features = features
+
+        if(class_weights is not None):
+            class_weights = torch.tensor(class_weights).to(torch.float32)
+
+        if out_features==2:
+            self.accuracy = torchmetrics.Accuracy(task='binary', num_classes=out_features)
+        else:
+            self.accuracy = torchmetrics.Accuracy(task='multiclass', num_classes=out_features)
+
+        self.loss = nn.CrossEntropyLoss(reduction='sum', weight=class_weights)
+
+        backbone = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+        layers = list(backbone.children())[:-1]
+
+
+        self.model_dict = nn.ModuleDict({
+            'resnet':nn.Sequential(*layers),
+            'lstm': nn.LSTM(2048, 512, batch_first=True),
+            'fc_c': nn.Linear(512, out_features),
+            'dropout': nn.Dropout(p=0.2)
+        })
+
+        init.xavier_normal_(self.model_dict['lstm'].all_weights[0][0])
+        init.xavier_normal_(self.model_dict['lstm'].all_weights[0][1])
+        init.xavier_uniform_(self.model_dict['fc_c'].weight)
+
+
+    def configure_optimizers(self):
+        optimizer = optim.SGD([
+                {'params': self.model_dict['resnet'].parameters()},
+                {'params': self.model_dict['lstm'].parameters()},
+                {'params': self.model_dict['fc_c'].parameters(), 'lr': self.args.lr},
+                ], lr=self.args.lr / 10, momentum=0.9, dampening=0, weight_decay=5e-4, nesterov=False)
+
+        return optimizer
+    
+    def forward(self, x):
+        x = x.contiguous()
+        batch_size, num_frames, channels, height, width = x.size()
+        x = x.view(batch_size * num_frames, channels, height, width)
+    
+        x = self.model_dict['resnet'](x)
+        x = x.view(-1, num_frames, 2048)
+
+        self.model_dict['lstm'].flatten_parameters()
+        y, _ = self.model_dict['lstm'](x)
+        y = y.contiguous().view(-1, 512)
+        y = self.model_dict['dropout'](y)
+
+        return y
+    
+    def training_step(self, train_batch, batch_idx):
+        x, y = train_batch
+        x = self.forward(x)
+        x = self.model_dict['fc_c'](x)
+
+        x = x[self.args.num_frames - 1::self.args.num_frames]
+
+        loss = self.loss(x, y)
+        self.log('train_loss', loss.item(), sync_dist=True)
+
+        x = torch.argmax(x, dim=1)
+        self.accuracy(x, y)
+        self.log("train_acc", self.accuracy)
+
+
+        return loss
+
+    def validation_step(self, val_batch, batch_idx):
+        x, y = val_batch
+
+        x = self.forward(x)
+        x = self.model_dict['fc_c'](x)
+
+        x = x[self.args.num_frames - 1::self.args.num_frames]
+
+        loss = self.loss(x, y)
+        self.log('val_loss', loss.item(), sync_dist=True, )
+
+
+        x = torch.argmax(x, dim=1)
+        self.accuracy(x, y)
+        self.log("val_acc", self.accuracy)
+
+        return loss
+
+class ResNetLSTM_p2(pl.LightningModule):
+    def __init__(self, args=None, out_features=4, class_weights=None, features=False):
+        super(ResNetLSTM_p2, self).__init__()
+
+        self.save_hyperparameters()
+        self.args = args
+
+        self.class_weights = class_weights
+        self.features = features
+
+        if(class_weights is not None):
+            class_weights = torch.tensor(class_weights).to(torch.float32)
+
+        self.memory_model = ResNetLSTM.load_from_checkpoint(self.args.lfb_model, strict=True)
+        self.memory_model.eval()
+        self.memory_model.cuda()
+        self.length_vid = 10
+
+            
+        self.loss = nn.CrossEntropyLoss(reduction='sum', weight=class_weights)
+        self.accuracy = torchmetrics.Accuracy(task='multiclass', num_classes=out_features)
+
+        backbone = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
+        layers = list(backbone.children())[:-1]
+
+        self.model_dict = nn.ModuleDict({
+            'memory': self.memory_model,
+            'resnet':nn.Sequential(*layers),
+            'lstm': nn.LSTM(2048, 512, batch_first=True),
+            'fc_c': nn.Linear(512, out_features),
+            'fc_h_c': nn.Linear(1024, 512),
+            'nl_bloc': NLBlock(),
+            'time_conv': TimeConv(),
+            'dropout': nn.Dropout(p=0.5)
+        })
+
+        init.xavier_normal_(self.model_dict['lstm'].all_weights[0][0])
+        init.xavier_normal_(self.model_dict['lstm'].all_weights[0][1])
+        init.xavier_uniform_(self.model_dict['fc_c'].weight)
+        init.xavier_uniform_(self.model_dict['fc_h_c'].weight)
+
+    def forward(self, x, long_feature):
+
+        batch_size, num_frames, channels, height, width = x.size()
+        x = x.contiguous().view(batch_size * num_frames, channels, height, width)
+    
+        ## creating features
+        x = self.model_dict['resnet'](x)
+        x = x.view(-1, num_frames, 2048)
+        self.model_dict['lstm'].flatten_parameters()
+        y, _ = self.model_dict['lstm'](x)
+        y = y.contiguous().view(-1, 512)
+        y = self.model_dict['dropout'](y)
+
+        y = y[num_frames - 1::num_frames]
+
+        Lt = self.model_dict['time_conv'](long_feature)
+
+        y_1 = self.model_dict['nl_bloc'](y, Lt)
+        y = torch.cat([y, y_1], dim=1)
+        y = self.model_dict['dropout'](self.model_dict['fc_h_c'](y))
+        y = F.relu(y)
+        y = self.model_dict['fc_c'](y)
+        return y
+
+    def configure_optimizers(self):
+        lr = self.args.lr
+        optimizer = optim.SGD([
+                {'params': self.model_dict['resnet'].parameters()},
+                {'params': self.model_dict['lstm'].parameters()},
+                {'params': self.model_dict['time_conv'].parameters(), 'lr': lr},
+                {'params': self.model_dict['nl_bloc'].parameters(), 'lr': lr},
+                {'params': self.model_dict['fc_h_c'].parameters(), 'lr': lr},
+                {'params': self.model_dict['fc_c'].parameters(), 'lr': lr},
+                ], lr=lr / 10, momentum=0.9, dampening=0, weight_decay=5e-4, nesterov=False)
+
+        return optimizer
+    
+    def training_step(self, train_batch, batch_idx):
+        x, y = train_batch
+
+        long_features= self.model_dict['memory'](x) # (BS* num_frames, 512)
+        long_features = long_features.view(-1, self.args.num_frames, 512)
+
+        ## take only 10 frames in x 
+        x = x[:,-self.length_vid:,:,:,:]
+
+        x = self.forward(x, long_features)
+
+        loss = self.loss(x, y)
+        self.log('train_loss', loss, sync_dist=True)
+
+        x = torch.argmax(x, dim=1)
+        self.accuracy(x, y)
+        self.log("train_acc", self.accuracy)
+
+        return loss
+
+    def validation_step(self, val_batch, batch_idx):
+        x, y = val_batch
+
+        long_features= self.model_dict['memory'](x) # (BS* num_frames, 512)
+        long_features = long_features.view(-1, self.args.num_frames, 512)
+
+        ## take only 10 frames in x 
+        x = x[:,-self.length_vid:,:,:,:]
+
+        x = self.forward(x, long_features)
+
+        loss = self.loss(x, y)
+        self.log('val_loss', loss.item(), sync_dist=True)
+
+        x = torch.argmax(x, dim=1)
+        self.accuracy(x, y)
+        self.log("val_acc", self.accuracy)
+
+        return loss
+
+
+class ResNetLSTM3(pl.LightningModule):
+
+    def __init__(self, args=None, out_features=4, class_weights=None, features=False):
+        super(ResNetLSTM3, self).__init__()
 
         self.save_hyperparameters()
         self.args = args
 
         if self.args.lfb_model:
-            self.memory_model = ResNetLSTM.load_from_checkpoint(self.args.lfb_model, strict=True)
+            self.memory_model = ResNetLSTM3.load_from_checkpoint(self.args.lfb_model, strict=True)
             self.memory_model.eval()
             self.memory_model.cuda()
 
@@ -243,7 +459,6 @@ class ResNetLSTM(pl.LightningModule):
         init.xavier_uniform_(self.fc_c.weight)
         init.xavier_uniform_(self.fc_h_c.weight)
 
-
     def configure_optimizers(self):
         
         optimizer = optim.SGD([
@@ -260,6 +475,7 @@ class ResNetLSTM(pl.LightningModule):
     def forward(self, x, long_feature=torch.empty((0), dtype=torch.float32)):
         ## forward for the network training
         x = x.contiguous()
+
         batch_size, num_frames, channels, height, width = x.size()
         x = x.view(batch_size * num_frames, channels, height, width)
     
@@ -284,6 +500,7 @@ class ResNetLSTM(pl.LightningModule):
         return y
 
     def training_step(self, train_batch, batch_idx):
+
         x, y = train_batch
         if self.args.lfb_model:
             long_features = self.memory_model(x)
