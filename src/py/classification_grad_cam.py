@@ -9,7 +9,8 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from nets.classification import HystNet, ResNetLSTM, ResNetLSTM_p2
+# from nets.net_gbp import ResNetLSTM, ResNetLSTM_p2, ResNetLSTM3
+from nets.classification import ResNetLSTM, ResNetLSTM_p2
 from loaders.hyst_dataset import HystDataset, TestTransforms
 from callbacks.logger import ImageLogger
 
@@ -55,125 +56,146 @@ def main(args):
     test_fn = args.csv
     
     df_test = pd.read_csv(test_fn)
+    print(df_test[args.class_column].unique())
 
-    use_class_column = False
-    if args.class_column is not None and args.class_column in df_test.columns:
-        use_class_column = True
+    for target_class in df_test[args.class_column].unique():
 
-    model = ResNetLSTM.load_from_checkpoint(args.model, strict=True)
-    model.eval()
-    model.cuda()
-    # print(model)
-    target_layers = model.model[-2]
+        if target_class == 1 :
 
-    # pdb.set_trace()
+            df_class = df_test.loc[df_test[args.class_column]==target_class]
+            df_class = df_class.reset_index()
+            print(df_class['class'].unique())
 
-    # model = resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
-    # target_layers = [model.layer4[-1]]
-    # model = nn.Sequential(
-    #     model.model[0], 
-    #     model.model[1],
-    #     AvgPool1D()
-    #     )
-    # model.eval()
-    # model.cuda()
-    # target_layers = [model[0].module.layer4[-1]]
+            test_ds = HystDataset(df_class, args.mount_point, img_column=args.img_column, class_column=args.class_column,num_frames=args.num_frames, transform=TestTransforms(num_frames=args.num_frames))
+            test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, prefetch_factor=4)
 
-    # Construct the CAM object once, and then re-use it on many images:
-    cam = GradCAM(model=model, target_layers=target_layers, use_cuda=True)
-    torch.backends.cudnn.enabled=False
-    # You can also use it within a with statement, to make sure it is freed,
-    # In case you need to re-create it inside an outer loop:
-    # with GradCAM(model=model, target_layers=target_layers, use_cuda=args.use_cuda) as cam:
-    #   ...
+            num_classes = len(np.unique(df_test[args.class_column]))
 
-    # We have to specify the target we want to generate
-    # the Class Activation Maps for.
-    # If targets is None, the highest scoring category
-    # will be used for every image in the batch.
-    # Here we use ClassifierOutputTarget, but you can define your own custom targets
-    # That are, for example, combinations of categories, or specific outputs in a non standard model.
+            use_class_column = False
+            if args.class_column is not None and args.class_column in df_test.columns:
+                use_class_column = True
 
-    test_ds = HystDataset(df_test, args.mount_point, img_column=args.img_column, class_column=args.class_column, transform=TestTransforms(num_frames=args.num_frames))
 
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, prefetch_factor=4)
+            # model = ResNetLSTM3.load_from_checkpoint(args.model, strict=True)
+                
 
-    scale_intensity = ScaleIntensityRange(0.0, 1.0, 0, 255)
+            if args.eval_bank:
+                model = ResNetLSTM(args, out_features=num_classes)
+            else:
+                model = ResNetLSTM_p2(args, out_features=num_classes)
+            
+            device = torch.device('cuda')
+            model.to(device)
+            model.eval()
+            
+            # 
+            # target_layer = model.model[-2]
+            # target_layer = model.memory_model.model[-2]
+            target_layer = model.model_dict.resnet[-2]
 
-    predictions = []
-    probs = []
-    features = []
-    pbar = tqdm(enumerate(test_loader), total=len(test_loader))
-    # pdb.set_trace()
-    for idx, X in pbar: 
-        if use_class_column:
-            X, Y = X
-        # X = X.cuda().contiguous()
-        # x = X.view(X.shape[0] * X.shape[1],X.shape[2], X.shape[3], X.shape[4])
 
-        
-        targets = [ClassifierOutputTarget(args.target_class)]
+            target_layers = [target_layer]
 
-        # You can also pass aug_smooth=True and eigen_smooth=True, to apply smoothing.
-        gcam_np = cam(input_tensor=X, targets=None)
+            # Construct the CAM object once, and then re-use it on many images:
+            cam = GradCAM(model=model, target_layers=target_layers)
+            torch.backends.cudnn.enabled=False
 
-        # print(np.min(gcam_np), np.max(gcam_np)) -> between 0, 0.9999
 
-        vid_path = df_test.loc[idx][args.img_column]
+            targets = None
+            if not target_class is None:
+                targets = [ClassifierOutputTarget(target_class)]
 
-        out_vid_path = vid_path.replace(os.path.splitext(vid_path)[1], '.mp4')
 
-        out_vid_path = os.path.join(args.out, out_vid_path)
+            scale_intensity = ScaleIntensityRange(0.0, 1.0, 0, 255)
+            
+            out_dir = args.out
 
-        out_dir = os.path.dirname(out_vid_path)
+            if not os.path.isdir(out_dir):
+                os.mkdir(out_dir)
 
-        if not os.path.exists(out_dir):
-            os.makedirs(out_dir)
+            pbar = tqdm(enumerate(test_loader), total=len(test_loader))
 
-        vid_np = scale_intensity(X).permute(0,1,3,4,2).squeeze().cpu().numpy().squeeze().astype(np.uint8)
-        gcam_np = scale_intensity(gcam_np).squeeze().numpy().astype(np.uint8)
+            # pdb.set_trace()
+            for idx, X in pbar:
+                if use_class_column:
+                    X, Y = X
+                X = X.cuda().contiguous()
 
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(out_vid_path, fourcc, args.fps, (256, 256))
+                concat = []
+                for i in range(args.num_frames):
+                    Xi = X[:,i,:,:,:]
+                    Xi = Xi.reshape((1,1,3,256,256))
 
-        for v, g in zip(vid_np, gcam_np):
-            c = cv2.applyColorMap(g, cv2.COLORMAP_JET)
-            b = cv2.addWeighted(v, 0.5, c, 0.5, 0)
-            out.write(b)
+                    # You can also pass aug_smooth=True and eigen_smooth=True, to apply smoothing.
+                    gcam_np= cam(input_tensor=Xi, targets=targets)
+                    concat.append(gcam_np)
 
-        out.release()
+                    # print(np.min(gcam_np), np.max(gcam_np)) -> between 0, 0.9999
 
-        # #batch,time,C,W,H -> batch,time,W,H,C
-        # img = sitk.GetImageFromArray(, isVector=True)
-        # sitk.WriteImage(img, out_img)
 
-        # grayscale_cam = sitk.GetImageFromArray(grayscale_cam)
-        # out_grad = out_img.replace('.nrrd', '_gradcam.nrrd')
-        # sitk.WriteImage(grayscale_cam, out_grad)
+                concat = np.array(concat)
+                concat = concat.reshape((args.num_frames, 1, 256, 256))
+
+                vid_path = df_class.loc[idx][args.img_column]
+
+                out_vid_path = vid_path.replace(os.path.splitext(vid_path)[1], '.mp4')
+
+                out_vid_path = os.path.join(out_dir, out_vid_path)
+
+                out_subdir = os.path.dirname(out_vid_path)
+
+                if not os.path.exists(out_subdir):
+                    os.makedirs(out_subdir)
+
+                vid_np = scale_intensity(X).permute(0,1,3,4,2).squeeze().cpu().numpy().squeeze().astype(np.uint8)
+                gcam_np = scale_intensity(concat).squeeze().numpy().astype(np.uint8)
+
+
+                print(vid_np.shape, gcam_np.shape)
+
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(out_vid_path, fourcc, args.fps, (256, 256))
+
+                for v, g in zip(vid_np, gcam_np):
+                    c = cv2.applyColorMap(g, cv2.COLORMAP_JET)
+                    b = cv2.addWeighted(v, 0.5, c, 0.5, 0)
+                    out.write(b)
+
+                out.release()
+
+
+def get_argparse():
+
+    parser = argparse.ArgumentParser(description='Classification GradCam')
+
+    input_group = parser.add_argument_group('Input')
+    input_group.add_argument('--csv', type=str, help='CSV file for testing', required=True)
+    input_group.add_argument('--img_column', help='Image/video column name', type=str, default='vid_path')
+    input_group.add_argument('--class_column', help='Class column', type=str, default='class')
+    input_group.add_argument('--num_frames', help='Number of frames for the prediction', type=int, default=512)
+    input_group.add_argument('--mount_point', help='Dataset mount directory', type=str, default="./")
+    input_group.add_argument('--eval_bank', help='bool to evaluate memory bank or full network', type=bool, default=False)
+    input_group.add_argument('--lfb_model', help='path to memory bank', type=str, default=False)
+
+
+    model_group = parser.add_argument_group('Model')
+    model_group.add_argument('--model', help='Model path to continue training', type=str, default=None)
+    model_group.add_argument('--target_layer', help='Target layer for GradCam. For example in ResNet, the target layer is the last conv layer which is layer4', type=str, default='layer4')
+    model_group.add_argument('--target_class', help='Target class', type=int, default=0)
+
+    model_group.add_argument('--num_workers', help='Number of workers for loading', type=int, default=4)
+    model_group.add_argument('--batch_size', help='Batch size', type=int, default=16)
+
+    output_group = parser.add_argument_group('Output')
+    output_group.add_argument('--out', help='Output directory', type=str, default="./")
+    output_group.add_argument('--fps', help='Frames per second', type=int, default=25)
+
+    return parser
 
 
 if __name__ == '__main__':
 
-
-    parser = argparse.ArgumentParser(description='Classification predict')
-    parser.add_argument('--csv', type=str, help='CSV file for testing', required=True)
-    parser.add_argument('--extract_features', type=int, help='Extract the features', default=0)
-    parser.add_argument('--img_column', help='Image/video column name', type=str, default='vid_path')
-    parser.add_argument('--class_column', help='Class column', type=str, default='class')
-    parser.add_argument('--lr', '--learning-rate', default=1e-4, type=float, help='Learning rate')
-    parser.add_argument('--model', help='Model path to continue training', type=str, default=None)
-    parser.add_argument('--epochs', help='Max number of epochs', type=int, default=200)    
-    parser.add_argument('--out', help='Output directory', type=str, default="./")
-    parser.add_argument('--pred_column', help='Output column name', type=str, default="pred")
-    parser.add_argument('--mount_point', help='Dataset mount directory', type=str, default="./")
-    parser.add_argument('--num_workers', help='Number of workers for loading', type=int, default=4)
-    parser.add_argument('--batch_size', help='Batch size', type=int, default=1)
-    # parser.add_argument('--nn', help='Type of neural network', type=str, default="efficientnet_b0")
-    parser.add_argument('--num_frames', help='Number of frames for the prediction', type=int, default=512)
-    parser.add_argument('--target_class', help='Target class', type=int, default=0)
-    parser.add_argument('--fps', help='Frames per second', type=int, default=20)
-
-
+    parser = get_argparse()
     args = parser.parse_args()
 
     main(args)

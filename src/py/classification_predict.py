@@ -7,8 +7,9 @@ import numpy as np
 import pdb
 import torch
 from torch.utils.data import DataLoader
-
-from nets.classification import HystNet, ResNetLSTM
+import torchmetrics
+# from nets.classification import HystNet, ResNetLSTM, ResNetLSTM_p2
+from nets.end_to_end import *
 from loaders.hyst_dataset import HystDataset, TestTransforms
 from callbacks.logger import ImageLogger
 
@@ -24,7 +25,7 @@ from sklearn.metrics import classification_report
 from tqdm import tqdm
 
 import pickle
-
+import copy 
 import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -33,24 +34,32 @@ def main(args):
     test_fn = args.csv
     
     df_test = pd.read_csv(test_fn)
+    num_classes = len(np.unique(df_test[args.class_column]))
 
     use_class_column = False
     if args.class_column is not None and args.class_column in df_test.columns:
         use_class_column = True
 
-    model = ResNetLSTM.load_from_checkpoint(args.model, strict=True)
+
+    # if args.eval_bank:
+    model = ResNetLSTM.load_from_checkpoint(args.model)
+    # else:
+    #     model = ResNetLSTM_p2.load_from_checkpoint(args.model)
+
+    # ckpt = copy.deepcopy(checkpoint)
+    # del ckpt['state_dict']['loss.weight']
+    # model.load_state_dict(ckpt['state_dict'])
+    
     model.eval()
     model.cuda()
-    
-    np.random.seed(26)
-    torch.random.manual_seed(26)
-    torch.cuda.random.manual_seed_all(26)
 
-    test_ds = HystDataset(df_test, args.mount_point, img_column=args.img_column,
+    test_ds = HystDataset(df_test, args.mount_point, img_column=args.img_column, num_frames=args.num_frames,
                           class_column=args.class_column, transform=TestTransforms(num_frames=args.num_frames))
 
-    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True, prefetch_factor=4)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, prefetch_factor=4)
 
+
+    num_frames = args.num_frames
     with torch.no_grad():
 
         predictions = []
@@ -61,30 +70,30 @@ def main(args):
             if use_class_column:
                 X, Y = X
             X = X.cuda().contiguous()   
-            if args.extract_features: 
-                x_f = model(X)
-                pred = model.fc_c(x_f)
-                pred = pred[args.num_frames - 1::args.num_frames]
 
-                features.append(x_f.cpu().numpy())
-            else:
-                # pred = model(X)
-                long_features= model.memory_model(X) # (BS* num_frames, 512)
-                long_features = long_features.view(-1, args.num_frames, 512)
+            X = X.view(1, num_frames, 3, 256, 256)
 
-                ## take only 10 random frames in x
-                X = X[:,-10:,:,:,:]
+            # if args.eval_bank:
+            #     long_features= model(X) # (BS* num_frames, 512)
+            #     long_features = long_features.view(-1, args.num_frames, 512)
+            #     pred = model.model_dict['fc_c'](long_features)
+            #     pred = pred[:,-1,:]
+            
+            # else:
+            #     long_features= model.memory_model(X) # (BS* num_frames, 512)
+            #     long_features = long_features.view(-1, args.num_frames, 512)
 
-                pred = model.forward(X, long_features)
-                
-                probs.append(pred.cpu().numpy())
-                pred = torch.argmax(pred, dim=1).cpu().numpy()
+            #     x = X[:,-model.length_vid:,:,:,:]
+            pred = model.forward(X)
 
-            # pbar.set_description("prediction: {pred}".format(pred=pred))
+            probs.append(pred.cpu().numpy())
+            pred = torch.argmax(pred, dim=1).cpu().numpy()
+
             predictions.append(pred)
+
             
     df_test[args.pred_column] = np.concatenate(predictions, axis=0)
-    probs = np.concatenate(probs, axis=0)    
+    probs = np.concatenate(probs, axis=0)
 
     out_dir = os.path.join(args.out, os.path.splitext(os.path.basename(args.model))[0])
     if not os.path.exists(out_dir):
@@ -128,6 +137,8 @@ if __name__ == '__main__':
     parser.add_argument('--nn', help='Type of neural network', type=str, default="efficientnet_b0")
     
     parser.add_argument('--lfb_model', help='Path to feature bank model', type=str, default=None)
+    parser.add_argument('--eval_bank', help='bool to evaluate memory bank or full network', type=bool, default=False)
+
 
     args = parser.parse_args()
 
