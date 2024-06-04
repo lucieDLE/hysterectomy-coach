@@ -175,8 +175,8 @@ class ResNetLSTM(pl.LightningModule):
 
         ## compute memory
         batch_size, num_frames, channels, height, width = x.size()
-        # long_feature = self.model_dict['memory'](x)
-        # long_feature = long_feature.view(-1, num_frames, 512)
+        long_feature = self.model_dict['memory'](x)
+        long_feature = long_feature.view(-1, num_frames, 512)
 
         x = x[:,-sequence_length:,:,:,:]
 
@@ -193,15 +193,15 @@ class ResNetLSTM(pl.LightningModule):
         y = y.contiguous().view(-1, 512)
         y = self.model_dict['dropout'](y)
 
-        # y = y[sequence_length - 1::sequence_length]
+        y = y[sequence_length - 1::sequence_length]
 
-        # Lt = self.model_dict['time_conv'](long_feature)
+        Lt = self.model_dict['time_conv'](long_feature)
 
-        # y_1 = self.model_dict['nl_bloc'](y, Lt)
-        # y = torch.cat([y, y_1], dim=1)
-        # y = self.model_dict['dropout'](self.model_dict['fc_h_c'](y))
-        # y = F.relu(y)
-        # y = self.model_dict['fc_c'](y)
+        y_1 = self.model_dict['nl_bloc'](y, Lt)
+        y = torch.cat([y, y_1], dim=1)
+        y = self.model_dict['dropout'](self.model_dict['fc_h_c'](y))
+        y = F.relu(y)
+        y = self.model_dict['fc_c'](y)
         
         return y
 
