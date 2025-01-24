@@ -8,13 +8,16 @@ from torchvision import transforms
 import cv2
 import imageio
 import random
-
+import SimpleITK as sitk
 from torch.utils.data import Sampler
 from torch.utils.data.distributed import DistributedSampler
-
+import monai
+import math
 from monai.transforms import (
     EnsureChannelFirst,
+    EnsureChannelFirstd,
     ToTensor,
+    SpatialPad,
     ScaleIntensityRange,
     RandGaussianNoise,
     Compose,
@@ -24,14 +27,15 @@ from monai.transforms import (
     EnsureType,
     Activations, 
     AsDiscrete, 
+    Padd,
     Resized,
     RandZoomd,
     Lambdad,
+    RandFlipd,
     CenterSpatialCrop,
     ResizeWithPadOrCrop
 )
 import pdb
-
 class HystDataset(Dataset):
     def __init__(self, df, mount_point = "./", transform=None, img_column="img_path", len_column = 'len_video', class_column=None, num_frames=30):
         self.df = df
@@ -135,6 +139,64 @@ class HystDataset(Dataset):
 
         return video
 
+class HystDatasetSeg(Dataset):
+    def __init__(self, df, mount_point = "./", transform=None, img_column="img_path", seg_column = 'seg_path', class_column='class_column'):
+        self.df = df
+        self.mount_point = mount_point
+        self.transform = transform
+        self.img_column = img_column
+        self.seg_column = seg_column
+        self.class_column = class_column
+
+        self.df_frames_idx= df.drop_duplicates(subset=[self.img_column]).reset_index()
+        # self.resize = monai.transforms.Resized(512)
+
+    def __len__(self):
+        return len(self.df_frames_idx)
+
+    def __getitem__(self, idx):
+        ## not very efficient
+        frame_path = self.df_frames_idx.loc[idx][self.img_column]
+        df_frame = self.df.loc[self.df[self.img_column]==frame_path]
+        img = os.path.join(self.mount_point, df_frame.iloc[0][self.img_column])
+        # seg = os.path.join(self.mount_point, df_frame.iloc[0][self.seg_column])
+
+        img_t = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(img)).copy())).to(torch.float32)
+        img_t /= 255
+        # seg_t = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(seg)).copy())).to(torch.float32)
+        shape = img_t.shape[:2]
+
+        bbx = []
+        masks = []
+        labels = []
+        ## create targets for mask rcnn model
+        for idx, row in df_frame.iterrows():
+
+            label = row[self.class_column]
+            labels.append(torch.tensor(label).unsqueeze(0))
+
+            seg_path = os.path.join(self.mount_point, row[self.seg_column])
+            seg_t = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(seg_path)).copy())).to(torch.float32)
+
+            x,y,w,h = row['x'], row['y'], row['w'], row['h']
+            bb = torch.Tensor([x*512, y*512, (x+w)*512, (y+h)*512])
+            bbx.append(bb.unsqueeze(0))
+            
+            # mask = torch.zeros_like(seg_t)
+            # mask[ seg_t == label] = 1
+
+            # ar_zeroed = torch.zeros_like(seg_t)
+            # slicey, slicex = slice(int(bb[1]), int(bb[3])+1), slice(int(bb[0]), int(bb[2])+1)
+            # ar_zeroed[slicey, slicex] = mask[slicey, slicex]
+
+            masks.append(seg_t.unsqueeze(0))
+
+        masks = torch.cat(masks)
+        bbx = torch.cat(bbx, axis=0)
+
+        d = {"img": img_t.permute(2,0,1), "labels": torch.cat(labels), "masks":  masks, "boxes":bbx}
+        return  d
+  
 
 class HystDataModule(pl.LightningDataModule):
     def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=256, num_workers=4, img_column="img_path",
@@ -184,6 +246,79 @@ class HystDataModule(pl.LightningDataModule):
 
         return DataLoader(self.test_ds, batch_size=self.batch_size, num_workers=self.num_workers, pin_memory=False, drop_last=self.drop_last, shuffle=False)
 
+class HystDataModuleSeg(pl.LightningDataModule):
+    def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=256, num_workers=4, img_column="img_path", seg_column="seg_path", class_column = 'class_column',balanced=False, train_transform=None, valid_transform=None, test_transform=None, drop_last=False):
+        super().__init__()
+
+        self.df_train = df_train
+        self.df_val = df_val
+        self.df_test = df_test
+        self.mount_point = mount_point
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.img_column = img_column
+        self.class_column = class_column
+        self.seg_column = seg_column  
+        self.train_transform = train_transform
+        self.valid_transform = valid_transform
+        self.test_transform = test_transform
+        self.drop_last=drop_last
+
+    def setup(self, stage=None):
+
+        # Assign train/val datasets for use in dataloaders
+        self.train_ds = monai.data.Dataset(data=HystDatasetSeg(self.df_train, mount_point=self.mount_point, img_column=self.img_column,class_column=self.class_column, seg_column=self.seg_column), transform=self.train_transform)
+        self.val_ds = monai.data.Dataset(HystDatasetSeg(self.df_val, mount_point=self.mount_point, img_column=self.img_column,class_column=self.class_column, seg_column=self.seg_column), transform=self.valid_transform)
+        self.test_ds = monai.data.Dataset(HystDatasetSeg(self.df_test, mount_point=self.mount_point, img_column=self.img_column,class_column=self.class_column, seg_column=self.seg_column), transform=self.test_transform)
+
+    def train_dataloader(self):
+        return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=self.num_workers, pin_memory=True, drop_last=self.drop_last, collate_fn=self.custom_collate_fn, shuffle=True)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=self.num_workers, drop_last=self.drop_last, collate_fn=self.custom_collate_fn)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_ds, batch_size=self.batch_size, num_workers=self.num_workers, drop_last=self.drop_last)
+
+    def compute_bb_mask(self, segs, pad=0.1):
+        # print(segs.shape)
+        shape = segs.shape[1:]
+        bbx = []
+        for bin_mask in segs:
+            ij = torch.argwhere(bin_mask.squeeze() !=0)
+            if len(ij) > 1:
+                bb = torch.tensor([0, 0, 0, 0])# xmin, ymin, xmax, ymax
+
+
+                bb[0] = torch.clip(torch.min(ij[:,1]) - shape[1]*pad, 0, shape[1])
+                bb[1] = torch.clip(torch.min(ij[:,0]) - shape[0]*pad, 0, shape[0])
+
+                bb[2] = torch.clip(torch.max(ij[:,1]) + shape[1]*pad, 0, shape[1])
+                bb[3] = torch.clip(torch.max(ij[:,0]) + shape[0]*pad, 0, shape[0])
+
+            else:
+                bb = torch.tensor([0, 0, 1, 1])# xmin, ymin, xmax, ymax
+
+            if bb[0] == bb[2]:
+                print(len(ij), bb, ij)
+            if bb[1] == bb[3]:
+                print(len(ij), bb, ij)
+
+            bbx.append(bb.unsqueeze(0))
+
+        return torch.cat(bbx)
+
+
+    def custom_collate_fn(self,batch):
+        targets = []
+        imgs = []
+        # pdb.set_trace()
+        for sample in batch:
+            img = sample.pop('img', None)
+            # sample['boxes'] = self.compute_bb_mask(sample['masks'], pad=0.1)
+            imgs.append(img.unsqueeze(0))
+            targets.append(sample)
+        return torch.cat(imgs), targets
 
 class TrainTransforms:
     def __init__(self, height: int = 256, num_frames=30):
@@ -232,6 +367,36 @@ class TestTransforms:
         return self.test_transform(inp)
 
 
+class TrainTransformsSeg:
+  def __init__(self):
+    # image augmentation functions
+    color_jitter = transforms.ColorJitter(brightness=[.5, 1.8], contrast=[0.5, 1.8], saturation=[.5, 1.8], hue=[-.2, .2])
+    self.train_transform = Compose(
+      [
+        # RandZoomd(keys=["img", "masks"], prob=0.5, min_zoom=0.5, max_zoom=1.5, mode=["area", "nearest"], padding_mode='constant'),
+        # SquarePad(keys=["img", "masks"]),
+        Resized(keys=["img", "masks"], spatial_size=[512, 512], mode=['area', 'nearest']),
+        # RandFlipd(keys=["img", "masks"], prob=0.5, spatial_axis=1),
+        # RandRotated(keys=["img", "masks"], prob=0.5, range_x=math.pi/2.0, range_y=math.pi/2.0, mode=["bilinear", "nearest"], padding_mode='zeros'),
+        ScaleIntensityd(keys=["img"]),
+        Lambdad(keys=['img'], func=lambda x: color_jitter(x))
+      ]
+    )
+  def __call__(self, inp):
+    return self.train_transform(inp)
+
+class EvalTransformsSeg:
+  def __init__(self):
+    self.eval_transform = Compose(
+      [
+        # SquarePad(keys=["img", "masks"]),
+        Resized(keys=["img", "masks"], spatial_size=[512, 512], mode=['area', 'nearest']),
+        ScaleIntensityd(keys=["img"])                
+      ]
+    )
+  def __call__(self, inp):
+    return self.eval_transform(inp)
+  
 class PermuteTimeChannel:
     def __init__(self, permute=(1,0,2,3)):
         self.permute = permute        
@@ -252,6 +417,18 @@ class RandomChoice:
                 idx, _ = torch.sort(idx)
                 x = x[idx]
         return x 
+
+class SquarePad:
+    def __init__(self, keys):
+        self.keys = keys
+    def __call__(self, X):
+
+        max_shape = []
+        for k in self.keys:
+            max_shape.append(torch.max(torch.tensor(X[k].shape)))
+        max_shape = torch.max(torch.tensor(max_shape)).item()
+        
+        return Padd(self.keys, padder=SpatialPad(spatial_size=(max_shape, max_shape)))(X)
 
 
 
