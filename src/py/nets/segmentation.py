@@ -5,6 +5,7 @@ from tqdm import tqdm
 import pdb
 from torch import nn
 from torchvision.models.detection.roi_heads import RoIHeads, fastrcnn_loss, maskrcnn_loss, maskrcnn_inference
+from utils import FocalLoss
 
 class CustomRoIHeads(RoIHeads):
     def __init__(self, *args, hparams=None, **kwargs):
@@ -13,6 +14,8 @@ class CustomRoIHeads(RoIHeads):
         self.hparams = hparams
         self.class_weights = torch.tensor(self.hparams.class_weights, dtype=torch.float32, device='cuda')
         self.ce_loss = nn.CrossEntropyLoss(weight=self.class_weights, label_smoothing=0.1)
+        self.focal_loss = FocalLoss(alpha=0.25, gamma=2.0, weights=self.class_weights)
+
 
     def forward(self, features, proposals, image_shapes, targets=None):
         result = []
@@ -35,6 +38,8 @@ class CustomRoIHeads(RoIHeads):
             labels = torch.cat(labels, dim=0)
 
             loss_classifier = self.ce_loss(class_logits, labels)
+            # yhot = nn.functional.one_hot(labels, num_classes=len(self.hparams.class_weights)).float()
+            # loss_classifier = self.focal_loss(class_logits, yhot)
 
             losses = {"loss_classifier": loss_classifier, "loss_box_reg": loss_box_reg}
         else:
@@ -94,19 +99,16 @@ class MaskRCNN(pl.LightningModule):
     # pdb.set_trace()
     
     self.model = models.detection.maskrcnn_resnet50_fpn(weights=models.detection.MaskRCNN_ResNet50_FPN_Weights.DEFAULT,
-                                                        rpn_post_nms_top_n_train=150,
-                                                        rpn_post_nms_top_n_test=100,
+                                                        rpn_post_nms_top_n_train=500,
+                                                        rpn_post_nms_top_n_test=200,
                                                         rpn_nms_thresh=0.8,
                                                         rpn_fg_iou_thresh=0.5,
                                                         rpn_batch_size_per_image=256, #default=256. Try increased and decreased
-                                                        detections_per_img=8,
-
+                                                        detections_per_img=15,
                                                         box_batch_size_per_image=512, #default=512. Increase if most proposal are background. Balanced pos/neg samples
                                                         )
 
     # ['loss_classifier', 'loss_box_reg', 'loss_mask', 'loss_objectness', 'loss_rpn_box_reg'])
-    self.loss_weights = [1.0 , 1.0, 1, 1.0, 1.0]
-    # self.loss_weights = [5, 2, 1, 3.0e-5, 4.0e-5]
 
     in_features = self.model.roi_heads.box_predictor.cls_score.in_features
     in_features_mask = self.model.roi_heads.mask_predictor.conv5_mask.in_channels
@@ -127,7 +129,7 @@ class MaskRCNN(pl.LightningModule):
                                           positive_fraction=0.25,
                                           score_thresh=0.5,
                                           nms_thresh=0.3,
-                                          detections_per_img=8,
+                                          detections_per_img=15,
                                           hparams = self.hparams,
                                           )
 
@@ -162,7 +164,7 @@ class MaskRCNN(pl.LightningModule):
       imgs, targets = train_batch
       total_loss =0
       loss_dict = self(imgs, targets, mode='train')
-      for w, n in zip(self.loss_weights, loss_dict.keys()):
+      for w, n in zip(self.hparams.loss_weights, loss_dict.keys()):
           loss = loss_dict[n]
           total_loss += w*loss
           self.log(f'train/{n}', loss, sync_dist=True)
@@ -175,7 +177,7 @@ class MaskRCNN(pl.LightningModule):
       imgs, targets = val_batch      
       loss_dict, preds = self(imgs, targets, mode='val')
       total_loss = 0
-      for w, n in zip(self.loss_weights, loss_dict.keys()):
+      for w, n in zip(self.hparams.loss_weights, loss_dict.keys()):
           loss = loss_dict[n]
           total_loss += w*loss
           self.log(f'val/{n}', loss, sync_dist=True)
