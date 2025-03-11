@@ -160,26 +160,27 @@ class MaskRCNN(pl.LightningModule):
   def training_step(self, train_batch, batch_idx):
       
       imgs, targets = train_batch
-      
+      total_loss =0
       loss_dict = self(imgs, targets, mode='train')
-      loss = sum([loss for loss in loss_dict.values()])
-      self.log('train_loss', loss,sync_dist=True,batch_size=self.hparams.batch_size)
+      for w, n in zip(self.loss_weights, loss_dict.keys()):
+          loss = loss_dict[n]
+          total_loss += w*loss
+          self.log(f'train/{n}', loss, sync_dist=True)
+      self.log('train_loss', total_loss,sync_dist=True,batch_size=self.hparams.batch_size)
+                
+      return total_loss
               
-      return loss
 
   def validation_step(self, val_batch, batch_idx):
       imgs, targets = val_batch      
       loss_dict, preds = self(imgs, targets, mode='val')
       total_loss = 0
-      for loss_name in loss_dict.keys():
-      # ['loss_classifier', 'loss_box_reg', 'loss_mask', 'loss_objectness', 'loss_rpn_box_reg'])
-        loss = loss_dict[loss_name]
-        total_loss += loss
-        self.log(f'val/{loss_name}', loss, sync_dist=True)
-        # totloss = sum([loss for loss in loss_dict.values()])
+      for w, n in zip(self.loss_weights, loss_dict.keys()):
+          loss = loss_dict[n]
+          total_loss += w*loss
+          self.log(f'val/{n}', loss, sync_dist=True)
   
       self.log('val_loss', total_loss,sync_dist=True,batch_size=self.hparams.batch_size)
-
   def predict_step(self, images):
       outputs = self(images, mode='test')
 
