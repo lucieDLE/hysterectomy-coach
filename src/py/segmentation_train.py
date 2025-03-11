@@ -1,5 +1,5 @@
 import os 
-os.environ['CUDA_VISIBLE_DEVICES']="1"
+# os.environ['CUDA_VISIBLE_DEVICES']="0"
 import argparse
 import pandas as pd
 import numpy as np 
@@ -8,7 +8,7 @@ import torch
 
 from collections import defaultdict
 from nets.segmentation import MaskRCNN
-from loaders.hyst_dataset import HystDataModuleSeg, TrainTransformsSeg, EvalTransformsSeg
+from loaders.hyst_dataset import HystDataModuleSeg, TrainTransformsSeg, EvalTransformsSeg,BBXImageEvalTransform,BBXImageTrainTransform,BBXImageTestTransform
 from callbacks.logger import ImageLogger, ImageSegLogger
 
 
@@ -110,6 +110,22 @@ def select_balanced_frames(args,df, target_per_class=None, max_deviation=0.2):
     
     return selected_df
 
+def remove_labels(df, args):
+    concats = ['Bipolar', 'Vessel Sealer', 'Robot Grasper Heat', 'Laparoscopic Scissors', 'Laparoscopic Suction', 'Robot Scissors', 'monopolarhook' ]
+
+    if concats is not None:
+        replacement_val =20
+        df.loc[ df['Instrument Name'].isin(concats), "class" ] = replacement_val
+
+    unique_classes = sorted(df[args.class_column].unique())
+    class_mapping = {value: idx+1 for idx, value in enumerate(unique_classes)}
+
+    df[args.class_column] = df[args.class_column].map(class_mapping)
+    df.rename(columns={concats[0]: 'Others'})
+
+    print(f"{df[[args.class_column]].drop_duplicates()}")
+    return df.reset_index()
+
 
 def main(args):
     train_fn = args.csv_train
@@ -121,21 +137,36 @@ def main(args):
     df_test = pd.read_csv(test_fn)
 
 
-    # df_train = df_train.loc[df_train['class_column'] != 8]
-    num_classes = len(df_train[args.class_column].unique()) + 1 # background
+    df_train = remove_labels(df_train, args)
+    df_val = remove_labels(df_val, args)
+    df_test = remove_labels(df_test, args)
+
+    print(df_train[ ['Instrument Name', 'class']].value_counts())
+
+    args_params = vars(args)
+    unique_classes = np.sort(np.unique(df_train[args.class_column]))
+    args_params['out_features'] = len(unique_classes)+1 # background
 
 
-    ### doesn't work well 
-    # g_train = df_train.groupby(args.class_column)
-    # df_train = g_train.apply(lambda x: x.sample(g_train.size().min())).reset_index(drop=True).sample(frac=1).reset_index(drop=True)
+    args_params['class_weights'] = np.ones(args_params['out_features'])
+    if args.balanced_weights:
+        unique_class_weights = np.array(class_weight.compute_class_weight(class_weight='balanced', classes=unique_classes, y=df_train[args.class_column]))
 
-    # g_val = df_val.groupby(args.class_column)
-    # df_val = g_val.apply(lambda x: x.sample(g_val.size().min())).reset_index(drop=True).sample(frac=1).reset_index(drop=True)
+        args_params['class_weights'] = np.concatenate((np.array([0]), unique_class_weights))
+
+    elif args.custom_weights:
+        args_params['class_weights'] = np.array(args.custom_weights)
+
+    elif args.balance_dataframe:
+        ## new way
+        df_train = select_balanced_frames(args,df_train, target_per_class=None, max_deviation=0.1)
+        df_val = select_balanced_frames(args,df_val, target_per_class=None, max_deviation=0.1)
+        
+        unique_class_weights = np.array(class_weight.compute_class_weight(class_weight='balanced', classes=unique_classes, y=df_train[args.class_column]))
+        args_params['class_weights'] = np.concatenate((np.array([0]), unique_class_weights))
 
 
-    ## new way
-    df_train = select_balanced_frames(args,df_train, target_per_class=None, max_deviation=0.1)
-    df_val = select_balanced_frames(args,df_val, target_per_class=None, max_deviation=0.1)
+    print(f"class weights: {args_params['class_weights']}")
 
     
     np.random.seed(42)
@@ -144,10 +175,12 @@ def main(args):
     
     ttdata = HystDataModuleSeg( df_train, df_val, df_test, batch_size=args.batch_size, num_workers=args.num_workers, 
                                 img_column=args.img_column,seg_column=args.seg_column, class_column=args.class_column, 
-                                mount_point=args.mount_point,train_transform=TrainTransformsSeg(),valid_transform=EvalTransformsSeg())
+                                mount_point=args.mount_point,train_transform=BBXImageTrainTransform(),valid_transform=BBXImageEvalTransform(), test_transform=BBXImageTestTransform())
 
-
-    model = MaskRCNN(num_classes=num_classes, **vars(args))
+    if args.model:
+        model = MaskRCNN.load_from_checkpoint(args.model, **vars(args), strict=False)
+    else:
+        model = MaskRCNN(**vars(args))
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.out,
@@ -182,6 +215,7 @@ def main(args):
         accelerator="gpu", 
         strategy=DDPStrategy(find_unused_parameters=True),
         log_every_n_steps=args.log_every_n_steps,
+        val_check_interval=0.3,
     )
 
     trainer.fit(model, datamodule=ttdata, ckpt_path=args.model)
@@ -201,15 +235,22 @@ if __name__ == '__main__':
     input_group.add_argument('--class_column', help='Class column', type=str, default='class_column')
     input_group.add_argument('--mount_point', help='Dataset mount directory', type=str, default="./")
     input_group.add_argument('--num_workers', help='Number of workers for loading', type=int, default=4)
-    
+    input_group.add_argument('--concat_labels', type=str, default=None, nargs='+', help='concat labels in dataframe')
+
+    weight_group = input_group.add_mutually_exclusive_group()
+    weight_group.add_argument('--balanced_weights', type=int, default=0, help='Compute weights for balancing the data')
+    weight_group.add_argument('--custom_weights', type=float, default=None, nargs='+', help='Custom weights for balancing the data')
+    weight_group.add_argument('--balance_dataframe', type=int, default=0, help='balance dataframe')
+
     hparams_group = parser.add_argument_group('Hyperparameters')
     hparams_group.add_argument('--lr', '--learning-rate', default=5e-4, type=float, help='Learning rate')
     hparams_group.add_argument('--epochs', help='Max number of epochs', type=int, default=500)
     hparams_group.add_argument('--patience', help='Max number of patience steps for EarlyStopping', type=int, default=30)
     hparams_group.add_argument('--batch_size', help='Batch size', type=int, default=16)
+    hparams_group.add_argument('--loss_weights', help='custom loss weights [classifier, box_reg, mask, objectness (rpn), box_reg (rpn)]', type=float, nargs='+', default=[1.0, 1.0, 1.0, 1.0, 1.0])
 
     logger_group = parser.add_argument_group('Logger')
-    logger_group.add_argument('--log_every_n_steps', help='Log every n steps', type=int, default=50)    
+    logger_group.add_argument('--log_every_n_steps', help='Log every n steps', type=int, default=5)    
     logger_group.add_argument('--logger', help='tensorboard, neptune or comet to log experiment', type=str, default=None)
     logger_group.add_argument('--tb_name', help='Tensorboard experiment name', type=str, default="hyst_classification")
     logger_group.add_argument('--neptune_tags', help='neptune tag', type=str, nargs='+', default=None)
