@@ -5,6 +5,9 @@ from tqdm import tqdm
 import pdb
 from torch import nn
 from torchvision.models.detection.roi_heads import RoIHeads, fastrcnn_loss, maskrcnn_loss, maskrcnn_inference
+from torchvision.models.detection.rpn import AnchorGenerator
+from torchvision.models.detection import MaskRCNN
+
 from utils import FocalLoss
 
 class CustomRoIHeads(RoIHeads):
@@ -96,16 +99,39 @@ class MaskRCNN(pl.LightningModule):
     super(MaskRCNN, self).__init__()        
     
     self.save_hyperparameters()
-    # pdb.set_trace()
+    # anchor_sizes = ((64,), (128,), (256,), (512,), (768,),(1024,),)
+    # aspect_ratios = ((0.25, 0.5, 1.0, 2.0, 4.0),) * len(anchor_sizes)
+
+    # anchor_sizes = ((64,), (128,), (256,), (512,), (1024,))
+    # aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
+
+    # anchor_generator = AnchorGenerator(sizes=anchor_sizes, aspect_ratios=aspect_ratios)
+
+    """
+    setting num 1: too many False Negative
+    rpn_nms_thresh=0.5
+    rpn_score_thresh=0.1,
+    (roi_head) score_thresh=0.7,
+    (roi_head) nms_thresh=0.3,
+
+    setting num 2: less FN but higher FP. Results are better with these
+    rpn_nms_thresh=0.6,
+    rpn_score_thresh=0.05,
+    (roi_head) score_thresh=0.5,
+    (roi_head) nms_thresh=0.4,
+
     
+    """
+
     self.model = models.detection.maskrcnn_resnet50_fpn(weights=models.detection.MaskRCNN_ResNet50_FPN_Weights.DEFAULT,
                                                         rpn_post_nms_top_n_train=500,
                                                         rpn_post_nms_top_n_test=200,
-                                                        rpn_nms_thresh=0.8,
-                                                        rpn_fg_iou_thresh=0.5,
+                                                        rpn_nms_thresh=0.6,
+                                                        rpn_score_thresh=0.05,
+                                                        rpn_fg_iou_thresh=0.7,
+                                                        rpn_bg_iou_thresh=0.6,
                                                         rpn_batch_size_per_image=256, #default=256. Try increased and decreased
-                                                        detections_per_img=15,
-                                                        box_batch_size_per_image=512, #default=512. Increase if most proposal are background. Balanced pos/neg samples
+
                                                         )
 
     # ['loss_classifier', 'loss_box_reg', 'loss_mask', 'loss_objectness', 'loss_rpn_box_reg'])
@@ -122,14 +148,14 @@ class MaskRCNN(pl.LightningModule):
                                           mask_head=self.model.roi_heads.mask_head,
                                           mask_predictor=models.detection.mask_rcnn.MaskRCNNPredictor(in_features_mask, hidden_layer, self.hparams.out_features),
 
-                                          fg_iou_thresh=0.5,
-                                          bg_iou_thresh=0.5,
+                                          fg_iou_thresh=0.6,
+                                          bg_iou_thresh=0.4,
                                           batch_size_per_image=512,
                                           bbox_reg_weights=None,
                                           positive_fraction=0.25,
                                           score_thresh=0.5,
-                                          nms_thresh=0.3,
-                                          detections_per_img=15,
+                                          nms_thresh=0.4,
+                                          detections_per_img=5,
                                           hparams = self.hparams,
                                           )
 

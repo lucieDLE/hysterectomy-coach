@@ -1,6 +1,6 @@
 import os 
 import pdb
-# os.environ['CUDA_VISIBLE_DEVICES']="1"
+os.environ['CUDA_VISIBLE_DEVICES']="1"
 import torch.multiprocessing
 torch.multiprocessing.set_sharing_strategy('file_system')
 
@@ -108,6 +108,10 @@ def main(args):
   print(df_test[ ['Instrument Name', 'class']].value_counts())
 
   num_classes = len(df_train[args.class_column].unique()) + 1 # background
+  args_params = vars(args)
+  unique_classes = np.sort(np.unique(df_train[args.class_column]))
+  args_params['out_features'] = len(unique_classes)+1 # background
+
 
   ttdata = HystDataModuleSeg(df_train, df_val, df_test, batch_size=1, num_workers=args.num_workers, 
                              img_column=args.img_column, seg_column=args.seg_column, class_column=args.class_column, 
@@ -122,7 +126,12 @@ def main(args):
   model.eval()
   model.cuda()
 
-  outdir_masks = os.path.join(args.out, 'masks/')
+  out_dir = os.path.splitext(args.model)[0]
+  if not os.path.exists(out_dir):
+    os.makedirs(out_dir)
+
+
+  outdir_masks = os.path.join(out_dir, 'masks/')
   if not os.path.exists(outdir_masks):
     os.makedirs(outdir_masks)
 
@@ -144,6 +153,11 @@ def main(args):
       gt_boxes = ttdata.compute_bb_mask(gt_masks, pad=0.01).numpy()
       gt_labels = batch[0]['labels'].cpu().detach().numpy()
 
+      gt_mul_mask = construct_multi_mask(gt_masks, gt_labels)
+      frame_name = test_ds.data.df_subject.iloc[idx][args.img_column].split('img/')[1].split('.nrrd')[0] 
+      gt_filename = os.path.join(outdir_masks, frame_name + '_mask_gt.nrrd')
+      # save_image(gt_filename, gt_mul_mask)
+
       # add an else: we should save mask with nothing to compare with ground truth with no detection 
       # -> not really fair to do it like this 
       if (pred_scores >=args.thr_score).any():
@@ -154,17 +168,11 @@ def main(args):
         refined_masks = refined_masks[:,0,:,:]
 
         # 2. Build multi - masks
-        gt_mul_mask = construct_multi_mask(gt_masks, gt_labels)
         pred_mul_mask = construct_multi_mask(refined_masks, refined_labels)
 
-        # 3. save these masks
-        frame_name = test_ds.data.df_subject.iloc[idx][args.img_column].split('img/')[1].split('.nrrd')[0] 
 
         pred_filename = os.path.join(outdir_masks, frame_name + '_mask_pred.nrrd')
-        save_image(pred_filename, pred_mul_mask)
-
-        gt_filename = os.path.join(outdir_masks, frame_name + '_mask_gt.nrrd')
-        save_image(gt_filename, gt_mul_mask)
+        # save_image(pred_filename, pred_mul_mask)
 
         # 1. save bounding boxes, scores and labels in pickle
         data_out.append({'gt_boxes': gt_boxes,
@@ -178,7 +186,7 @@ def main(args):
 
 
   # 4. save labels and scores for analysis
-  outfile = os.path.join(args.out, 'predictions.pickle')
+  outfile = os.path.join(out_dir, 'predictions.pickle')
   with open(outfile, 'wb') as handle:
     pickle.dump(data_out, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -197,14 +205,13 @@ if __name__ == '__main__':
   input_group.add_argument('--csv_test', help='CSV for testing', type=str, required=True)
   input_group.add_argument('--img_column', help='Image/video column name', type=str, default='img_path')
   input_group.add_argument('--seg_column', help='segmentation column name', type=str, default='seg_path')
-  input_group.add_argument('--class_column', help='Class column', type=str, default='class_column')
+  input_group.add_argument('--class_column', help='Class column', type=str, default='class')
   input_group.add_argument('--mount_point', help='Dataset mount directory', type=str, default="./")
   input_group.add_argument('--num_workers', help='Number of workers for loading', type=int, default=4)
   
   input_group.add_argument('--thr_score', help='confidence score threshold to select best predictions', type=float, default=0.2)
   input_group.add_argument('--thr_mask', help='mask threshold to cleanup mask', type=float, default=0.1)
   output_group = parser.add_argument_group('Output')
-  output_group.add_argument('--out', help='Output', type=str, default="./")
   
   args = parser.parse_args()
   main(args)

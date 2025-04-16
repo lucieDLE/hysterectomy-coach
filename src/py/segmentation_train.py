@@ -182,6 +182,21 @@ def main(args):
     else:
         model = MaskRCNN(**vars(args))
 
+    # Train only the RPN and classification head - 1st stage 
+    for param in model.model.rpn.parameters():
+        param.requires_grad = True
+    for param in model.model.roi_heads.parameters():
+        param.requires_grad = True
+
+    for param in model.model.backbone.body.layer1.parameters():
+        param.requires_grad = False
+    for param in model.model.backbone.body.layer2.parameters():
+        param.requires_grad = False
+    for param in model.model.backbone.body.layer3.parameters():
+        param.requires_grad = False
+    for param in model.model.backbone.body.layer4.parameters():
+        param.requires_grad = True
+
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.out,
         filename='{epoch}-{val_loss:.2f}',
@@ -210,7 +225,7 @@ def main(args):
     trainer = Trainer(
         logger=logger,
         max_epochs=args.epochs,
-        callbacks=[ checkpoint_callback, early_stop_callback, image_logger],
+        callbacks=[ checkpoint_callback, image_logger],
         devices=torch.cuda.device_count(), 
         accelerator="gpu", 
         strategy=DDPStrategy(find_unused_parameters=True),
