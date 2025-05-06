@@ -36,6 +36,7 @@ from monai.transforms import (
     ResizeWithPadOrCrop
 )
 import albumentations as A
+from transformers import Mask2FormerImageProcessor
 
 import pdb
 
@@ -206,6 +207,94 @@ class HystDatasetSeg(Dataset):
     
         return  d
   
+class HystDatasetFormer(Dataset):
+    def __init__(self, df, mount_point="./", transform=None, img_column="img_path", seg_column='seg_path', class_column='class_column', for_mask2former=False):
+        self.df = df
+        self.mount_point = mount_point
+        self.transform = transform
+        self.img_column = img_column
+        self.seg_column = seg_column
+        self.class_column = class_column
+        
+        self.processor = Mask2FormerImageProcessor(
+            do_resize=True,
+            size={"height": 1024, "width": 1024},
+            ignore_index=255,
+            do_normalize=True,
+            reduce_labels=False,
+        )
+
+        self.df_subject = self.df[self.img_column].drop_duplicates().reset_index()
+
+    def __len__(self):
+        return len(self.df_subject)
+
+    def __getitem__(self, idx):
+        subject = self.df_subject.iloc[idx][self.img_column]  # frame path
+        img_path = os.path.join(self.mount_point, subject)
+
+        df_patches = self.df.loc[self.df[self.img_column] == subject]
+
+        img_t = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(img_path)).copy())).to(torch.float32)
+        img_t /= 255
+        shape = img_t.shape[:2]
+        self.current_img = img_path
+
+        bbx = []
+        masks = []
+        labels = []
+
+        # Create targets for model
+        for j, row in df_patches.iterrows():
+            label = row[self.class_column]
+            labels.append(torch.tensor(label).unsqueeze(0))
+
+            seg_path = os.path.join(self.mount_point, row[self.seg_column])
+            seg_t = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(seg_path)).copy())).to(torch.float32)
+
+
+            x, y, w, h = row['x'] * shape[1], row['y'] * shape[0], row['w'] * shape[1], row['h'] * shape[0]
+            bb = torch.tensor([np.clip(x, 0, shape[1] - 5),
+                            np.clip(y, 0, shape[0] - 5),
+                            np.clip((x + w + 1), 5, shape[1]),
+                            np.clip((y + h + 1), 5, shape[0])])
+
+            bbx.append(bb.unsqueeze(0))
+            masks.append(seg_t.unsqueeze(0))
+
+        masks = torch.cat(masks)
+        bbx = torch.cat(bbx, axis=0)
+        labels = torch.cat(labels)
+
+        d_augmented = self.transform(image=img_t.numpy(), bboxes=bbx.numpy(), category_ids=labels.numpy(), mask=masks.numpy())
+        img_t = d_augmented['image']
+        masks = d_augmented['mask']
+        boxes = d_augmented['bboxes']
+
+
+        instance_seg_map = np.zeros(img_t.shape[:2], dtype=np.int32)
+        instance_id_to_semantic_id = {}
+
+        for inst_id, (mask, class_id) in enumerate(zip(masks, labels), start=1):
+            instance_seg_map[mask > 0] = inst_id
+            instance_id_to_semantic_id[inst_id] = int(class_id)
+
+
+        if len(np.unique(instance_seg_map)) == 1: # only 0 -> no object take new sample
+            return self.__getitem__(random.randint(0, len(self) - 1))
+
+        else:
+            inputs = self.processor.encode_inputs(
+                                    pixel_values_list=[torch.tensor(img_t).permute(2, 0, 1)],
+                                    segmentation_maps=[instance_seg_map],
+                                    instance_id_to_semantic_id=[instance_id_to_semantic_id],
+                                    reduce_labels=False,
+                                    ignore_index=0,
+                                    return_tensors="pt")
+        
+            d = inputs
+            return d
+
 
 class HystDataModule(pl.LightningDataModule):
     def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=256, num_workers=4, img_column="img_path",
@@ -328,6 +417,48 @@ class HystDataModuleSeg(pl.LightningDataModule):
             imgs.append(img.unsqueeze(0))
             targets.append(sample)
         return torch.cat(imgs), targets
+
+class HystDataModuleFormer(pl.LightningDataModule):
+    def __init__(self, df_train, df_val, df_test, mount_point="./", batch_size=256, num_workers=4, img_column="img_path", seg_column="seg_path", class_column = 'class_column',balanced=False, train_transform=None, valid_transform=None, test_transform=None, drop_last=False):
+        super().__init__()
+
+        self.df_train = df_train
+        self.df_val = df_val
+        self.df_test = df_test
+        self.mount_point = mount_point
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.img_column = img_column
+        self.class_column = class_column
+        self.seg_column = seg_column  
+        self.train_transform = train_transform
+        self.valid_transform = valid_transform
+        self.test_transform = test_transform
+        self.drop_last=drop_last
+
+    def setup(self, stage=None):
+
+        # Assign train/val datasets for use in dataloaders
+        self.train_ds = monai.data.Dataset(HystDatasetFormer(self.df_train, mount_point=self.mount_point, img_column=self.img_column,class_column=self.class_column, seg_column=self.seg_column, transform=self.train_transform))
+        self.val_ds = monai.data.Dataset(HystDatasetFormer(self.df_val, mount_point=self.mount_point, img_column=self.img_column,class_column=self.class_column, seg_column=self.seg_column, transform=self.valid_transform))
+        self.test_ds = monai.data.Dataset(HystDatasetFormer(self.df_test, mount_point=self.mount_point, img_column=self.img_column,class_column=self.class_column, seg_column=self.seg_column, transform=self.test_transform))
+
+    def train_dataloader(self):
+        return DataLoader(self.train_ds, batch_size=self.batch_size, num_workers=self.num_workers, pin_memory=True, drop_last=self.drop_last, collate_fn=self.custom_collate_fn, shuffle=True)
+
+    def val_dataloader(self):
+        return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=self.num_workers, drop_last=self.drop_last, collate_fn=self.custom_collate_fn)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_ds, batch_size=self.batch_size, num_workers=self.num_workers, drop_last=self.drop_last, collate_fn=self.custom_collate_fn)
+
+
+    def custom_collate_fn(self,batch):
+        pixel_values = torch.stack([example["pixel_values"][0] for example in batch])
+        pixel_mask = torch.stack([example["pixel_mask"][0] for example in batch])
+        class_labels = [example["class_labels"][0] for example in batch]
+        mask_labels = [example["mask_labels"][0] for example in batch]
+        return {"pixel_values": pixel_values, "pixel_mask": pixel_mask, "class_labels": class_labels, "mask_labels": mask_labels}
 
 class TrainTransforms:
     def __init__(self, height: int = 256, num_frames=30):

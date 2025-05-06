@@ -7,8 +7,12 @@ from torch import nn
 from torchvision.models.detection.roi_heads import RoIHeads, fastrcnn_loss, maskrcnn_loss, maskrcnn_inference
 from torchvision.models.detection.rpn import AnchorGenerator
 from torchvision.models.detection import MaskRCNN
+from collections import defaultdict
+import numpy as np
 
 from utils import FocalLoss
+from utils import *
+from transformers import Mask2FormerForUniversalSegmentation, Mask2FormerImageProcessor
 
 class CustomRoIHeads(RoIHeads):
     def __init__(self, *args, hparams=None, **kwargs):
@@ -126,7 +130,7 @@ class MaskRCNN(pl.LightningModule):
     self.model = models.detection.maskrcnn_resnet50_fpn(weights=models.detection.MaskRCNN_ResNet50_FPN_Weights.DEFAULT,
                                                         rpn_post_nms_top_n_train=500,
                                                         rpn_post_nms_top_n_test=200,
-                                                        rpn_nms_thresh=0.6,
+                                                        rpn_nms_thresh=0.8,
                                                         rpn_score_thresh=0.05,
                                                         rpn_fg_iou_thresh=0.7,
                                                         rpn_bg_iou_thresh=0.6,
@@ -148,13 +152,13 @@ class MaskRCNN(pl.LightningModule):
                                           mask_head=self.model.roi_heads.mask_head,
                                           mask_predictor=models.detection.mask_rcnn.MaskRCNNPredictor(in_features_mask, hidden_layer, self.hparams.out_features),
 
-                                          fg_iou_thresh=0.6,
-                                          bg_iou_thresh=0.4,
+                                          fg_iou_thresh=0.4,
+                                          bg_iou_thresh=0.3,
                                           batch_size_per_image=512,
                                           bbox_reg_weights=None,
                                           positive_fraction=0.25,
-                                          score_thresh=0.5,
-                                          nms_thresh=0.4,
+                                          score_thresh=0.3,
+                                          nms_thresh=0.5,
                                           detections_per_img=5,
                                           hparams = self.hparams,
                                           )
@@ -227,3 +231,141 @@ class MaskRCNN(pl.LightningModule):
         seg_mask[ masks[i]> thr ] = labels[i]
   
       return seg_mask
+
+
+class Mask2Former(pl.LightningModule):
+    def __init__(self, **kwargs):
+        super(Mask2Former, self).__init__()
+        
+        self.save_hyperparameters()
+        
+        # Load pretrained Mask2Former model
+        self.model = Mask2FormerForUniversalSegmentation.from_pretrained("facebook/mask2former-swin-base-coco-instance",num_labels=self.hparams.out_features, ignore_mismatched_sizes=True)
+        
+        self.processor = Mask2FormerImageProcessor( do_resize=True, size={"height": 1024, "width": 1024}, ignore_index=255, do_normalize=True, reduce_labels=False,)
+
+    def process_outputs(self, images, outputs):
+        original_sizes = [(img.shape[0],img.shape[1]) for img in images]  # example sizes
+
+        result = self.processor.post_process_instance_segmentation(outputs, target_sizes=original_sizes)
+        return result
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=0.01)
+        return optimizer
+
+    def forward(self, batch):
+        outputs = self.model(pixel_values=batch["pixel_values"],
+                             mask_labels=batch["mask_labels"],
+                             class_labels=batch["class_labels"],
+                             )
+
+        return outputs.loss, outputs
+
+    def training_step(self, batch, batch_idx):
+        loss, _ = self(batch)
+        self.log('train_loss', loss, sync_dist=True, batch_size=self.hparams.batch_size)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        loss, _ = self(batch)
+                
+        self.log('val_loss', loss, sync_dist=True, batch_size=self.hparams.batch_size)
+        return loss
+
+    def predict_step(self, batch, batch_idx):
+        # Get model outputs
+        loss, out = self(batch)
+        
+        processed_outputs = self.process_outputs(batch['pixel_values'], out)
+
+        # Apply custom processing for merging overlapping masks of the same class
+        final_results = []
+        for result in processed_outputs:
+            segmentation = result["segmentation"]
+            segments_info = result["segments_info"]
+            
+            # Create a list to store merged segments
+            processed_segments = self.merge_same_class_segments(segmentation, segments_info)
+            
+            # Create final segmentation map
+            final_seg = torch.zeros_like(torch.tensor(segmentation))
+            for segment in processed_segments:
+                mask = segmentation == segment["id"]
+                final_seg[mask] = segment["label_id"]
+            
+            final_results.append(final_seg)
+        
+        return torch.stack(final_results)
+
+    def merge_same_class_segments(self, segmentation, segments_info, iou_threshold=0.5, adjacency_distance=50):
+        """Merge segments of the same class that are overlapping or adjacent"""
+        
+        # Group segments by class
+        class_to_segments = defaultdict(list)
+        for segment in segments_info:
+            class_to_segments[segment["label_id"]].append(segment)
+        
+        # Process each class separately
+        merged_segments = []
+        for class_id, segments in class_to_segments.items():
+            # If only one segment for this class, no need to merge
+            if len(segments) <= 1:
+                merged_segments.extend(segments)
+                continue
+            
+            # Find segments to merge
+            groups = []
+            processed = set()
+            
+            for i, seg1 in enumerate(segments):
+                if i in processed:
+                    continue
+                
+                # Start a new group
+                group = [i]
+                processed.add(i)
+                
+                # Find all segments that should be merged with this one
+                for j, seg2 in enumerate(segments):
+                    if j in processed or i == j:
+                        continue
+                    
+                    # Calculate masks
+                    mask1 = segmentation == seg1["id"]
+                    mask2 = segmentation == seg2["id"]
+                    
+                    # Check if masks overlap or are adjacent
+                    overlap = np.logical_and(mask1, mask2).sum()
+                    if overlap > 0:
+                        # Masks overlap
+                        group.append(j)
+                        processed.add(j)
+                        continue
+                    
+                    # Check if masks are adjacent
+                    # This is a simplified approach - you might want a more sophisticated distance calculation
+                    dilated_mask1 = binary_dilation(mask1, iterations=adjacency_distance//2)
+                    if np.logical_and(dilated_mask1, mask2).sum() > 0:
+                        group.append(j)
+                        processed.add(j)
+                
+                groups.append(group)
+            
+            # Merge segments in each group
+            for group in groups:
+                if len(group) == 1:
+                    merged_segments.append(segments[group[0]])
+                    continue
+                
+                # Find the segment with highest score or largest area as the primary one
+                primary_idx = max(group, key=lambda idx: segments[idx].get("score", 0) * segments[idx].get("area", 1))
+                merged_segment = segments[primary_idx].copy()
+                
+                # Update the area to include all segments in the group
+                total_area = sum(segments[idx].get("area", 0) for idx in group)
+                merged_segment["area"] = total_area
+                
+                merged_segments.append(merged_segment)
+        
+        return merged_segments
