@@ -242,7 +242,9 @@ class Mask2Former(pl.LightningModule):
         # Load pretrained Mask2Former model
         self.model = Mask2FormerForUniversalSegmentation.from_pretrained("facebook/mask2former-swin-base-coco-instance",num_labels=self.hparams.out_features, ignore_mismatched_sizes=True)
         
-        self.processor = Mask2FormerImageProcessor( do_resize=True, size={"height": 1024, "width": 1024}, ignore_index=255, do_normalize=True, reduce_labels=False,)
+        self.processor = Mask2FormerImageProcessor.from_pretrained("facebook/mask2former-swin-base-coco-instance")
+
+        # self.processor = Mask2FormerImageProcessor( do_resize=True, size={"height": 1024, "width": 1024}, ignore_index=255, do_normalize=True, reduce_labels=False,)
 
     def process_outputs(self, images, outputs):
         original_sizes = [(img.shape[0],img.shape[1]) for img in images]  # example sizes
