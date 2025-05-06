@@ -454,11 +454,18 @@ class HystDataModuleFormer(pl.LightningDataModule):
 
 
     def custom_collate_fn(self,batch):
-        pixel_values = torch.stack([example["pixel_values"][0] for example in batch])
-        pixel_mask = torch.stack([example["pixel_mask"][0] for example in batch])
-        class_labels = [example["class_labels"][0] for example in batch]
-        mask_labels = [example["mask_labels"][0] for example in batch]
-        return {"pixel_values": pixel_values, "pixel_mask": pixel_mask, "class_labels": class_labels, "mask_labels": mask_labels}
+        pixel_values = []
+        pixel_mask = []
+        class_labels = []
+        mask_labels = []
+        for sample in batch:
+            pixel_values.append(sample["pixel_values"][0])
+            pixel_mask.append(sample["pixel_mask"][0])
+            class_labels.append(sample["class_labels"][0])
+            mask_labels.append(sample["mask_labels"][0])
+
+        return {"pixel_values": torch.stack(pixel_values), "pixel_mask": torch.stack(pixel_mask),
+                 "class_labels": class_labels, "mask_labels": mask_labels}
 
 class TrainTransforms:
     def __init__(self, height: int = 256, num_frames=30):
