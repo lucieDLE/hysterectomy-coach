@@ -293,6 +293,7 @@ class HystDatasetFormer(Dataset):
                                     return_tensors="pt")
         
             d = inputs
+            d['boxes'] = boxes
             return d
 
 
@@ -458,11 +459,13 @@ class HystDataModuleFormer(pl.LightningDataModule):
         pixel_mask = []
         class_labels = []
         mask_labels = []
+        boxes = []
         for sample in batch:
             pixel_values.append(sample["pixel_values"][0])
             pixel_mask.append(sample["pixel_mask"][0])
             class_labels.append(sample["class_labels"][0])
             mask_labels.append(sample["mask_labels"][0])
+            boxes.append(sample['boxes'][0])
 
         return {"pixel_values": torch.stack(pixel_values), "pixel_mask": torch.stack(pixel_mask),
                  "class_labels": class_labels, "mask_labels": mask_labels}
@@ -710,3 +713,121 @@ class BalancedBatchSampler(Sampler):
         return self.num_iterations 
 
 
+def find_masks(data_root_dir, l_names, version):
+
+    mask_list=[]
+    class_list = []
+    for name in l_names: ## video name
+        if os.path.isdir(os.path.join(data_root_dir, name)):
+            vid_dir = os.path.join(data_root_dir, name)
+
+            for frame_n in os.listdir(vid_dir):
+
+                mask_dir = os.path.join(vid_dir, frame_n, str(version),'binary_annotations')
+
+                if os.path.isdir(mask_dir):
+                    for f in os.listdir(mask_dir):
+                        if os.path.splitext(f)[1] == '.png':
+
+                            if 'class' in f:
+                                file_version = os.path.join(mask_dir, f)
+                                if os.path.exists(file_version):
+                                    mask_list.append(file_version)
+                                    class_name = os.path.splitext(f.split('class')[1])[0]
+                                    class_list.append(int(class_name))
+    return mask_list, class_list
+
+
+class HystSamDataset(Dataset):
+    def __init__(self, df, mount_point="./", transform=None, img_column="img_path", seg_column='seg_path', class_column='class_column', for_mask2former=False):
+        self.df = df
+        self.mount_point = mount_point
+        self.transform = transform
+        self.img_column = img_column
+        self.seg_column = seg_column
+        self.class_column = class_column
+        
+        self.processor = Mask2FormerImageProcessor(
+            do_resize=True,
+            size={"height": 1024, "width": 1024},
+            ignore_index=255,
+            do_normalize=True,
+            reduce_labels=False,
+        )
+
+        self.df_subject = self.df[self.img_column].drop_duplicates().reset_index()
+
+    def __len__(self):
+        return len(self.df_subject)
+
+    def __getitem__(self, idx):
+        subject = self.df_subject.iloc[idx][self.img_column]  # frame path
+        img_path = os.path.join(self.mount_point, subject)
+
+        df_patches = self.df.loc[self.df[self.img_column] == subject]
+
+        img_t = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(img_path)).copy())).to(torch.float32)
+        img_t /= 255
+        shape = img_t.shape[:2]
+        self.current_img = img_path
+
+        bbx = []
+        masks = []
+        labels = []
+
+        # Create targets for model
+        for j, row in df_patches.iterrows():
+            label = row[self.class_column]
+            labels.append(torch.tensor(label).unsqueeze(0))
+
+            seg_path = os.path.join(self.mount_point, row[self.seg_column])
+            seg_t = torch.tensor(np.squeeze(sitk.GetArrayFromImage(sitk.ReadImage(seg_path)).copy())).to(torch.float32)
+
+
+            x, y, w, h = row['x'] * shape[1], row['y'] * shape[0], row['w'] * shape[1], row['h'] * shape[0]
+            bb = torch.tensor([np.clip(x, 0, shape[1] - 5),
+                            np.clip(y, 0, shape[0] - 5),
+                            np.clip((x + w + 1), 5, shape[1]),
+                            np.clip((y + h + 1), 5, shape[0])])
+
+            bbx.append(bb.unsqueeze(0))
+            masks.append(seg_t.unsqueeze(0))
+
+
+
+        mask_name = self.mask_list[index]
+
+
+        sub_dir, mask_id = mask_name.split(f'/{self.version}/binary_annotations')
+        frame_n = sub_dir.split('/')[-1]
+
+        
+        # get class id from mask_name 
+        cls_id = int(re.search(r"class(\d+)", mask_name).group(1))
+        # if cls_id == 0:
+        #     cls_id = self.num_classes
+        # cls_id = 1
+
+        # get pre-computed sam feature 
+        feat_dir = osp.join(sub_dir, str(self.version), f"sam_features_{self.vit_mode}", frame_n + '.npy')
+        try:
+            sam_feat = np.load(feat_dir)
+        except:
+            sam_feat = np.zeros((64, 64, self.img_size))    
+        # get ground-truth mask
+        try: 
+            mask = cv2.imread(mask_name, cv2.IMREAD_GRAYSCALE)
+            mask = cv2.resize(mask, (self.img_size, self.img_size)) 
+        except:
+            mask = np.zeros((self.img_size, self.img_size))
+        
+        # get class embedding
+        class_embedding_path = mask_name.replace("binary_annotations", f"class_embeddings_{self.vit_mode}").replace("png","npy")
+        
+        try:
+            class_embedding = np.load(class_embedding_path)
+        except:
+            class_embedding = np.zeros((self.img_size, ))
+            
+        return sam_feat, mask_name, cls_id, mask, class_embedding
+ 
