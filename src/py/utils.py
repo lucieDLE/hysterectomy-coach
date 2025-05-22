@@ -26,6 +26,13 @@ class FocalLoss(nn.Module):
 		else:
 			return F_loss
 
+def convert_to_binary_mask(pred_masks):
+  pred_masks[pred_masks>0.1] = 1
+  if len(pred_masks.shape) >3:
+      pred_masks = pred_masks.squeeze()
+  if len(pred_masks.shape) == 2:
+      pred_masks = pred_masks.unsqueeze(0)
+  return pred_masks
 
 def plot_confusion_matrix(cm, classes, normalize=False, title='Confusion matrix', cmap=plt.cm.Blues):
   """
@@ -55,6 +62,69 @@ def plot_confusion_matrix(cm, classes, normalize=False, title='Confusion matrix'
   plt.tight_layout()
 
   return cm
+
+
+
+def isinBox(box1, box2):
+  x11, y11, x12, y12 = box1
+  x21, y21, x22, y22 = box2
+
+  if (x11 < x21) and (x12 > x22):
+    if (y11 < y21) and (y12 > y22):
+      return True
+  return False
+
+def select_indices_to_keep(pred_labels, pred_boxes, pred_scores, iou_thr = 0.4):
+  """
+  Remove predictions if 1) box fully contained in another bigger box, 2) if iou > 0.7, 
+  3) if most of the box is contained in a bigger box and have the same labels 
+  (#TODO: maybe combined them instead)
+  """
+  n_pred = pred_labels.shape[0]
+  indices_to_remove = []
+  for j in range(n_pred):
+    if j not in indices_to_remove :
+      for i in range(n_pred):
+        if i!=j: # skip itself
+          if isinBox(pred_boxes[j], pred_boxes[i]):
+            indices_to_remove.append(i)
+          iou, ratios = compute_bbx_iou(pred_boxes[j], pred_boxes[i], return_containment_ratio=True)
+
+          if (iou > iou_thr):
+            if pred_scores[i] > pred_scores[j]:
+              indices_to_remove.append(j)
+            else :
+              indices_to_remove.append(i)
+          if ratios[1] - ratios[0] >0.5:
+            if pred_labels[i] == pred_labels[j]:
+              # maybe for this one we should combine them ?
+              indices_to_remove.append(i)
+
+          elif (ratios[0] >0.55) and (ratios[1]>0.55): # 2 overlaps that are very close
+
+            if pred_scores[i] > pred_scores[j]:
+              indices_to_remove.append(j)
+            else :
+              indices_to_remove.append(i)
+
+
+  indices_to_keep = np.linspace(0,n_pred-1, n_pred, dtype=int)
+  indices_to_remove = np.unique(indices_to_remove)
+  if len(indices_to_remove) > 0:
+    indices_to_keep = np.delete(indices_to_keep, indices_to_remove)
+  return indices_to_keep
+
+def remove_small_predictions(boxes, min_width=20, min_height=20):
+    widths = boxes[:, 2] - boxes[:, 0]
+    heights = boxes[:, 3] - boxes[:, 1]
+
+    keep_indices = (widths >= min_width) & (heights >= min_height)
+    return keep_indices
+
+def apply_indices_selection(input_dic, indices):
+  output_dic = { k: v[indices] for k, v in input_dic.items()}
+  return output_dic
+
 
 def compute_mask_iou(gt_mask, pred_mask) :
   """
@@ -163,26 +233,26 @@ def match_boxes(gt_boxes, pred_boxes):
   return gt_indices, pred_indices
 
 
-def evaluate_with_fp_fn(gt_boxes, pred_boxes):
-  if len(pred_boxes.shape) == 1:
-    pred_boxes = torch.tensor(pred_boxes).unsqueeze(0)
+# def evaluate_with_fp_fn(gt_boxes, pred_boxes):
+#   if len(pred_boxes.shape) == 1:
+#     pred_boxes = torch.tensor(pred_boxes).unsqueeze(0)
 
-  gt_indices, pred_indices = match_boxes(gt_boxes, pred_boxes)
+#   gt_indices, pred_indices = match_boxes(gt_boxes, pred_boxes)
 
-  ious = []
-  num_pred =0
-  for gt_idx, pred_idx in zip(gt_indices, pred_indices):
-    num_pred+=1
+#   ious = []
+#   num_pred =0
+#   for gt_idx, pred_idx in zip(gt_indices, pred_indices):
+#     num_pred+=1
 
-    iou = compute_bbx_iou(gt_boxes[gt_idx], pred_boxes[pred_idx])
-    ious.append(iou)
+#     iou = compute_bbx_iou(gt_boxes[gt_idx], pred_boxes[pred_idx])
+#     ious.append(iou)
   
-  # Count false positives (unmatched predictions)
-  num_false_positives = len(pred_boxes) - len(pred_indices)
+#   # Count false positives (unmatched predictions)
+#   num_false_positives = len(pred_boxes) - len(pred_indices)
 
-  # Count false negatives (unmatched GT boxes)
-  num_false_negatives = len(gt_boxes) - len(gt_indices)
-  return num_pred, num_false_positives, num_false_negatives, ious, gt_indices, pred_indices
+#   # Count false negatives (unmatched GT boxes)
+#   num_false_negatives = len(gt_boxes) - len(gt_indices)
+#   return num_pred, num_false_positives, num_false_negatives, ious, gt_indices, pred_indices
 
 
 def select_balanced_frames(args,df, target_per_class=None, max_deviation=0.2):
@@ -272,164 +342,164 @@ def select_balanced_frames(args,df, target_per_class=None, max_deviation=0.2):
     
     return selected_df
 
-# Helper function for binary dilation (for adjacency check)
-def binary_dilation(array, iterations=1):
-    """Simple binary dilation implementation"""
-    import numpy as np
-    dilated = np.copy(array)
-    for _ in range(iterations):
-        padded = np.pad(dilated, 1, mode='constant', constant_values=0)
-        dilated = np.zeros_like(dilated)
-        for i in range(3):
-            for j in range(3):
-                if i == 1 and j == 1:
-                    continue
-                dilated |= padded[i:i+dilated.shape[0], j:j+dilated.shape[1]]
-    return dilated
+# # Helper function for binary dilation (for adjacency check)
+# def binary_dilation(array, iterations=1):
+#     """Simple binary dilation implementation"""
+#     import numpy as np
+#     dilated = np.copy(array)
+#     for _ in range(iterations):
+#         padded = np.pad(dilated, 1, mode='constant', constant_values=0)
+#         dilated = np.zeros_like(dilated)
+#         for i in range(3):
+#             for j in range(3):
+#                 if i == 1 and j == 1:
+#                     continue
+#                 dilated |= padded[i:i+dilated.shape[0], j:j+dilated.shape[1]]
+#     return dilated
 
-# Custom merging function for inference
-def merge_overlapping_detections(segmentation, segments_info, iou_threshold=0.5, adjacency_distance=50, score_threshold=0.3):
-    """
-    Merge detections of the same class that are either overlapping significantly or adjacent.
-    adjacency_distance: Maximum pixel distance to consider segments as adjacent
-    score_threshold: Minimum score to keep a detection
+# # Custom merging function for inference
+# def merge_overlapping_detections(segmentation, segments_info, iou_threshold=0.5, adjacency_distance=50, score_threshold=0.3):
+#     """
+#     Merge detections of the same class that are either overlapping significantly or adjacent.
+#     adjacency_distance: Maximum pixel distance to consider segments as adjacent
+#     score_threshold: Minimum score to keep a detection
     
-    merged_segmentation: Updated segmentation map
-    merged_segments_info: Updated segments information
-    """
-    import numpy as np
-    from collections import defaultdict
+#     merged_segmentation: Updated segmentation map
+#     merged_segments_info: Updated segments information
+#     """
+#     import numpy as np
+#     from collections import defaultdict
     
-    filtered_segments = [seg for seg in segments_info if seg.get("score", 1.0) > score_threshold]
+#     filtered_segments = [seg for seg in segments_info if seg.get("score", 1.0) > score_threshold]
     
-    # Group segments by class
-    class_to_segments = defaultdict(list)
-    for segment in filtered_segments:
-        class_to_segments[segment["label_id"]].append(segment)
+#     # Group segments by class
+#     class_to_segments = defaultdict(list)
+#     for segment in filtered_segments:
+#         class_to_segments[segment["label_id"]].append(segment)
     
-    merged_segmentation = np.zeros_like(segmentation)
-    next_id = 1 
+#     merged_segmentation = np.zeros_like(segmentation)
+#     next_id = 1 
     
-    merged_segments_info = []
+#     merged_segments_info = []
     
-    for class_id, segments in class_to_segments.items():
-        # If only one segment for this class, no need to merge
-        if len(segments) <= 1:
-            for segment in segments:
-                mask = segmentation == segment["id"]
-                merged_segmentation[mask] = next_id
+#     for class_id, segments in class_to_segments.items():
+#         # If only one segment for this class, no need to merge
+#         if len(segments) <= 1:
+#             for segment in segments:
+#                 mask = segmentation == segment["id"]
+#                 merged_segmentation[mask] = next_id
                 
-                new_segment = segment.copy()
-                new_segment["id"] = next_id
-                merged_segments_info.append(new_segment)
+#                 new_segment = segment.copy()
+#                 new_segment["id"] = next_id
+#                 merged_segments_info.append(new_segment)
                 
-                next_id += 1
-            continue
+#                 next_id += 1
+#             continue
         
-        # For each segment, check if it overlaps with or is adjacent to any other segment
-        segment_masks = []
-        for segment in segments:
-            mask = segmentation == segment["id"]
-            segment_masks.append(mask)
+#         # For each segment, check if it overlaps with or is adjacent to any other segment
+#         segment_masks = []
+#         for segment in segments:
+#             mask = segmentation == segment["id"]
+#             segment_masks.append(mask)
         
-        # Check each pair of segments
-        to_merge = []
-        for i in range(len(segments)):
-            for j in range(i+1, len(segments)):
-                # Check if masks overlap
-                overlap = np.logical_and(segment_masks[i], segment_masks[j]).sum()
-                if overlap > 0:
-                    to_merge.append((i, j))
-                    continue
+#         # Check each pair of segments
+#         to_merge = []
+#         for i in range(len(segments)):
+#             for j in range(i+1, len(segments)):
+#                 # Check if masks overlap
+#                 overlap = np.logical_and(segment_masks[i], segment_masks[j]).sum()
+#                 if overlap > 0:
+#                     to_merge.append((i, j))
+#                     continue
                 
-                # Check if masks are adjacent
-                # Dilate first mask and check if it overlaps with second mask
-                from scipy.ndimage import binary_dilation
-                dilated_mask = binary_dilation(segment_masks[i], iterations=adjacency_distance//2)
-                if np.logical_and(dilated_mask, segment_masks[j]).sum() > 0:
-                    to_merge.append((i, j))
+#                 # Check if masks are adjacent
+#                 # Dilate first mask and check if it overlaps with second mask
+#                 from scipy.ndimage import binary_dilation
+#                 dilated_mask = binary_dilation(segment_masks[i], iterations=adjacency_distance//2)
+#                 if np.logical_and(dilated_mask, segment_masks[j]).sum() > 0:
+#                     to_merge.append((i, j))
         
-        # Group segments to merge using a union-find algorithm
-        parent = list(range(len(segments)))
+#         # Group segments to merge using a union-find algorithm
+#         parent = list(range(len(segments)))
         
-        def find(x):
-            if parent[x] != x:
-                parent[x] = find(parent[x])
-            return parent[x]
+#         def find(x):
+#             if parent[x] != x:
+#                 parent[x] = find(parent[x])
+#             return parent[x]
         
-        def union(x, y):
-            parent[find(x)] = find(y)
+#         def union(x, y):
+#             parent[find(x)] = find(y)
         
-        for i, j in to_merge:
-            union(i, j)
+#         for i, j in to_merge:
+#             union(i, j)
         
-        # Create groups of segments to merge
-        groups = defaultdict(list)
-        for i in range(len(segments)):
-            groups[find(i)].append(i)
+#         # Create groups of segments to merge
+#         groups = defaultdict(list)
+#         for i in range(len(segments)):
+#             groups[find(i)].append(i)
         
-        # Merge each group
-        for group in groups.values():
-            if len(group) == 1:
-                # Single segment, no merging needed
-                segment = segments[group[0]]
-                mask = segment_masks[group[0]]
-                merged_segmentation[mask] = next_id
+#         # Merge each group
+#         for group in groups.values():
+#             if len(group) == 1:
+#                 # Single segment, no merging needed
+#                 segment = segments[group[0]]
+#                 mask = segment_masks[group[0]]
+#                 merged_segmentation[mask] = next_id
                 
-                # Update segment info
-                new_segment = segment.copy()
-                new_segment["id"] = next_id
-                merged_segments_info.append(new_segment)
-            else:
-                # Merge multiple segments
-                merged_mask = np.zeros_like(segment_masks[0], dtype=bool)
-                for idx in group:
-                    merged_mask = np.logical_or(merged_mask, segment_masks[idx])
+#                 # Update segment info
+#                 new_segment = segment.copy()
+#                 new_segment["id"] = next_id
+#                 merged_segments_info.append(new_segment)
+#             else:
+#                 # Merge multiple segments
+#                 merged_mask = np.zeros_like(segment_masks[0], dtype=bool)
+#                 for idx in group:
+#                     merged_mask = np.logical_or(merged_mask, segment_masks[idx])
                 
-                # Use the segment with highest score as the primary one
-                primary_idx = max(group, key=lambda idx: segments[idx].get("score", 0))
-                primary_segment = segments[primary_idx].copy()
+#                 # Use the segment with highest score as the primary one
+#                 primary_idx = max(group, key=lambda idx: segments[idx].get("score", 0))
+#                 primary_segment = segments[primary_idx].copy()
                 
-                # Update merged mask in output segmentation
-                merged_segmentation[merged_mask] = next_id
+#                 # Update merged mask in output segmentation
+#                 merged_segmentation[merged_mask] = next_id
                 
-                # Update segment info
-                primary_segment["id"] = next_id
-                primary_segment["area"] = int(merged_mask.sum())
-                merged_segments_info.append(primary_segment)
+#                 # Update segment info
+#                 primary_segment["id"] = next_id
+#                 primary_segment["area"] = int(merged_mask.sum())
+#                 merged_segments_info.append(primary_segment)
             
-            next_id += 1
+#             next_id += 1
     
-    return merged_segmentation, merged_segments_info
+#     return merged_segmentation, merged_segments_info
 
-def inference_with_merging(model, image, processor, device="cuda", iou_threshold=0.5, adjacency_distance=50, score_threshold=0.3):
-    """Run inference with Mask2Former and apply custom merging logic"""
-    model.to(device)
-    model.eval()
+# def inference_with_merging(model, image, processor, device="cuda", iou_threshold=0.5, adjacency_distance=50, score_threshold=0.3):
+    # """Run inference with Mask2Former and apply custom merging logic"""
+    # model.to(device)
+    # model.eval()
     
-    inputs = processor(images=image, return_tensors="pt")
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    # inputs = processor(images=image, return_tensors="pt")
+    # inputs = {k: v.to(device) for k, v in inputs.items()}
     
-    with torch.no_grad():
-        outputs = model(**inputs)
+    # with torch.no_grad():
+    #     outputs = model(**inputs)
     
-    # Post-process outputs
-    results = processor.post_process_panoptic_segmentation(
-        outputs,
-        target_sizes=[image.size[::-1]] if hasattr(image, 'size') else [image.shape[:2]],
-        label_ids_to_fuse=set(),  # Don't fuse any labels
-    )[0]
+    # # Post-process outputs
+    # results = processor.post_process_panoptic_segmentation(
+    #     outputs,
+    #     target_sizes=[image.size[::-1]] if hasattr(image, 'size') else [image.shape[:2]],
+    #     label_ids_to_fuse=set(),  # Don't fuse any labels
+    # )[0]
     
-    # Apply custom merging
-    merged_segmentation, merged_segments_info = merge_overlapping_detections(
-        results["segmentation"],
-        results["segments_info"],
-        iou_threshold=iou_threshold,
-        adjacency_distance=adjacency_distance,
-        score_threshold=score_threshold
-    )
+    # # Apply custom merging
+    # merged_segmentation, merged_segments_info = merge_overlapping_detections(
+    #     results["segmentation"],
+    #     results["segments_info"],
+    #     iou_threshold=iou_threshold,
+    #     adjacency_distance=adjacency_distance,
+    #     score_threshold=score_threshold
+    # )
     
-    return {
-        "segmentation": merged_segmentation,
-        "segments_info": merged_segments_info
-    }
+    # return {
+    #     "segmentation": merged_segmentation,
+    #     "segments_info": merged_segments_info
+    # }
