@@ -257,8 +257,25 @@ def get_prediction_metrics(gt, pred, stats_dic, iou_threshold=0.5):
                 if pred_masks is not None and gt_masks is not None:
                     mask_iou = compute_iou_masks([pred_masks[i]], [gt_masks[gt_idx]])[0, 0]
                     dice = compute_dice(pred_masks[i], gt_masks[gt_idx])
+
+                    # Track AP-style info
+                    stats_dic['mask_scores'].append(pred_score.item())
+                    stats_dic['mask_true'].append(1)  # matched = TP
+                    stats_dic['mask_classes'].append(gt_labels[gt_idx].item())
+
+
                     stats_dic['stats_mask_iou'].append(mask_iou.item())
                     stats_dic['stats_dice'].append(dice.item())
+                    class_id = gt_labels[gt_idx].item()
+                    stats_dic['dice_per_class'][class_id].append(dice.item())
+
+        # After loop — remaining unmatched predictions = FP
+        for i in range(len(pred_boxes)):
+            if i not in matched_pred:
+                stats_dic['mask_scores'].append(pred_scores[i].item())
+                stats_dic['mask_true'].append(0)  # unmatched = FP
+                stats_dic['mask_classes'].append(pred_labels[i].item())
+
 
         total_fn += len(gt_boxes) - len(matched_gt)
         total_fp += len(pred_boxes) - len(matched_pred)
@@ -285,6 +302,8 @@ def compute_global_metrics(classes, y_true, y_pred, stats, iou_threshold=0.5) :
 
     # Compute AP per class (macro average)
     ap_per_class = {}
+    dice_per_class = {}
+
     for cls in classes:
         cls_id = classes.index(cls) +1
         y_true_bin = [1 if y == cls_id else 0 for y in y_true]
@@ -294,6 +313,13 @@ def compute_global_metrics(classes, y_true, y_pred, stats, iou_threshold=0.5) :
         else:
             ap = float('nan')  # or 0.0
         ap_per_class[cls] = ap
+
+        dice_scores = stats['dice_per_class'].get(cls_id, [])
+        if dice_scores:
+            dice_per_class[cls] = np.mean(dice_scores)
+        else:
+            dice_per_class[cls] = float('nan')  # or 0.0 if you prefer
+
     valid_aps = [ap for ap in ap_per_class.values() if not np.isnan(ap)]
     mean_ap = np.mean(valid_aps) if valid_aps else 0.0
 
@@ -305,6 +331,8 @@ def compute_global_metrics(classes, y_true, y_pred, stats, iou_threshold=0.5) :
                  'mean_box_iou': np.mean(mean_box_iou) ,
                  'mean_mask_iou': np.mean(mean_mask_iou) ,
                  'mean_dice': np.mean(mean_dice) ,
+                'dice_per_class': dice_per_class,
+
                  'false_positives': fp,
                  'false_negatives': fn,
                  'true_positives': tp,
