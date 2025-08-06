@@ -11,7 +11,7 @@ import cv2
 import matplotlib.colors as mcolors
 
 
-# start from 21400
+# start from 23470
 @st.cache_data
 def load_csv(path):
     df = pd.read_csv(path)
